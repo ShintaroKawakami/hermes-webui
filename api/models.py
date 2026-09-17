@@ -3767,15 +3767,6 @@ def _path_stat_cache_key(path):
         return None
 
 
-def _sqlite_file_stat_cache_key(db_path: Path):
-    """Return a cheap invalidation key for a SQLite DB and WAL sidecars."""
-    return (
-        _path_stat_cache_key(db_path),
-        _path_stat_cache_key(Path(f"{db_path}-wal")),
-        _path_stat_cache_key(Path(f"{db_path}-shm")),
-    )
-
-
 def _resolve_cli_sessions_context():
     # Use the active WebUI profile's HERMES_HOME to find state.db.
     # The active profile is determined by what the user has selected in the UI
@@ -3799,14 +3790,17 @@ def _resolve_cli_sessions_context():
 
     db_path = hermes_home / 'state.db'
     projects_dir = _default_claude_code_projects_dir()
+    # [fix] 2026-09-18: keep this identity key stable while Hermes writes its
+    # SQLite WAL or WebUI rewrites the session index. Those file stats change
+    # for ordinary activity; including them created a new single-flight key per
+    # write and let several cold projections run in parallel. The five-second
+    # TTL and explicit ``clear_cli_sessions_cache()`` calls provide freshness
+    # without turning normal writes into a cache stampede.
     cache_key = (
         str(hermes_home),
         str(cli_profile or ''),
         str(db_path),
-        _sqlite_file_stat_cache_key(db_path),
         _path_cache_key(projects_dir),
-        _path_stat_cache_key(projects_dir),
-        _path_stat_cache_key(SESSION_INDEX_FILE),
     )
     return hermes_home, db_path, cli_profile, cache_key
 
