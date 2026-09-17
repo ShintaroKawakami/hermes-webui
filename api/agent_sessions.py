@@ -581,21 +581,50 @@ def read_importable_agent_session_rows(
                 raw_source_where = " AND ".join(
                     clause.replace("s.", "sf.", 1) for clause in where_clauses
                 )
+                # Modern Hermes databases carry a covering (source, id)
+                # index.  Use it for the source gate so the bounded message
+                # candidate scan does not fetch every wide sessions row just
+                # to reject cron/WebUI records.  The fallback keeps older
+                # databases on the previously validated EXISTS path.
+                source_index_available = "idx_sessions_source_id" in session_indexes
+                if source_index_available:
+                    source_lookup_cte = f"""
+                ), allowed_session_rows AS (
+                    SELECT sf.rowid AS session_rowid, sf.id
+                    FROM sessions sf INDEXED BY idx_sessions_source_id
+                    WHERE {raw_source_where}
+                """
+                    raw_source_join = "JOIN allowed_session_rows allowed ON allowed.id = lm.session_id"
+                    raw_source_filter = ""
+                    empty_rows_filter = (
+                        "s.rowid IN (SELECT session_rowid FROM allowed_session_rows)"
+                    )
+                    raw_source_params = params
+                    empty_rows_params = []
+                else:
+                    source_lookup_cte = ""
+                    raw_source_join = ""
+                    raw_source_filter = f"""
+                      AND EXISTS (
+                          SELECT 1 FROM sessions sf
+                          WHERE sf.id = lm.session_id
+                            AND {raw_source_where}
+                      )"""
+                    empty_rows_filter = " AND ".join(where_clauses)
+                    raw_source_params = params
+                    empty_rows_params = params
                 empty_scan_limit = max(candidate_limit * 8, candidate_limit)
                 candidate_cte = f"""
                 WITH RECURSIVE latest_messages AS (
                     SELECT mx.session_id, MAX(mx.timestamp) AS last_message_at
                     FROM messages mx
                     GROUP BY mx.session_id
-                ), message_candidates_raw AS (
+                {source_lookup_cte}), message_candidates_raw AS (
                     SELECT lm.session_id AS id, lm.last_message_at
                     FROM latest_messages lm
+                    {raw_source_join}
                     WHERE lm.last_message_at IS NOT NULL
-                      AND EXISTS (
-                          SELECT 1 FROM sessions sf
-                          WHERE sf.id = lm.session_id
-                            AND {raw_source_where}
-                      )
+                    {raw_source_filter}
                     ORDER BY lm.last_message_at DESC
                     LIMIT ?
                 ), null_message_candidates AS (
@@ -622,7 +651,7 @@ def read_importable_agent_session_rows(
                 ), empty_candidate_rows AS (
                     SELECT s.rowid AS session_rowid
                     FROM sessions s INDEXED BY idx_sessions_started
-                    WHERE {' AND '.join(where_clauses)}
+                    WHERE {empty_rows_filter}
                     ORDER BY s.started_at DESC
                     LIMIT ?
                 ), empty_candidates AS (
@@ -654,13 +683,13 @@ def read_importable_agent_session_rows(
                 )
                 """
                 candidate_params = [
-                    *params,
+                    *raw_source_params,
                     candidate_limit,
                     *params,
                     candidate_limit,
                     *params,
                     candidate_limit,
-                    *params,
+                    *empty_rows_params,
                     empty_scan_limit,
                     *params,
                     candidate_limit,

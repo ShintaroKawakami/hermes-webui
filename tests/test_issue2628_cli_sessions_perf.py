@@ -78,6 +78,7 @@ def _make_modern_state_db(path, *, sessions=80):
         CREATE INDEX idx_sessions_effective_activity
             ON sessions(COALESCE(last_activity_at, started_at) DESC, started_at DESC);
         CREATE INDEX idx_sessions_started ON sessions(started_at DESC);
+        CREATE INDEX idx_sessions_source_id ON sessions(source, id);
         CREATE TABLE messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT,
@@ -420,8 +421,12 @@ def test_modern_candidate_projection_full_query_has_no_wide_session_scan(monkeyp
     details = [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)]
     conn.close()
 
-    assert any("SCAN s USING INDEX idx_sessions_started" in detail for detail in details)
+    assert any(
+        "SCAN s USING" in detail and "idx_sessions_started" in detail
+        for detail in details
+    )
     assert any("SEARCH s USING INTEGER PRIMARY KEY" in detail for detail in details)
+    assert any("COVERING INDEX idx_sessions_source_id" in detail for detail in details)
     assert not any(detail == "SCAN s" for detail in details)
 
 
