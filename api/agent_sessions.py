@@ -431,6 +431,10 @@ def read_importable_agent_session_rows(
         session_cols = {row[1] for row in cur.fetchall()}
         cur.execute("PRAGMA table_info(messages)")
         message_cols = {row[1] for row in cur.fetchall()}
+        cur.execute("PRAGMA index_list(sessions)")
+        session_indexes = {row[1] for row in cur.fetchall()}
+        cur.execute("PRAGMA index_list(messages)")
+        message_indexes = {row[1] for row in cur.fetchall()}
         if 'source' not in session_cols:
             log.warning(
                 "agent session listing skipped: state.db at %s has no 'source' column "
@@ -501,12 +505,14 @@ def read_importable_agent_session_rows(
             use_messages_join
             and messages_has_timestamp
             and 'last_activity_at' in session_cols
+            and 'idx_messages_session' in message_indexes
+            and 'idx_sessions_effective_activity' in session_indexes
         )
         if use_messages_join and messages_has_timestamp:
             order_by_clause = "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC"
             if fast_message_candidates:
                 candidate_order_clause = (
-                    "ORDER BY lm.last_message_at DESC,\n"
+                    "ORDER BY COALESCE(lm.last_message_at, s.started_at) DESC,\n"
                     "                    s.started_at DESC"
                 )
             else:
@@ -573,15 +579,17 @@ def read_importable_agent_session_rows(
                     FROM latest_messages lm
                     JOIN sessions s ON s.id = lm.session_id
                     WHERE {' AND '.join(where_clauses)}
-                    ORDER BY lm.last_message_at DESC, s.started_at DESC
+                    ORDER BY COALESCE(lm.last_message_at, s.started_at) DESC,
+                             s.started_at DESC
                     LIMIT ?
                 ), empty_candidates AS (
                     SELECT s.id, NULL AS last_message_at, s.started_at
                     FROM sessions s
-                    LEFT JOIN latest_messages lm ON lm.session_id = s.id
                     WHERE {' AND '.join(where_clauses)}
                       AND COALESCE(s.message_count, 0) <= 0
-                      AND lm.session_id IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM messages m0 WHERE m0.session_id = s.id
+                      )
                     ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC,
                              s.started_at DESC
                     LIMIT ?

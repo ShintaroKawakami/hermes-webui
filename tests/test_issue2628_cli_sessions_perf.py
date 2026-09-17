@@ -226,6 +226,33 @@ def test_modern_candidate_projection_keeps_resumed_old_session(tmp_path):
     assert "FROM latest_messages lm" in src
 
 
+def test_modern_candidate_projection_falls_back_to_started_at_for_null_timestamp(tmp_path):
+    """A message with a NULL timestamp still follows the sidebar recency contract."""
+    db = tmp_path / "state.db"
+    _make_modern_state_db(db)
+    conn = sqlite3.connect(str(db))
+    newest = time.time() + 120
+    conn.execute(
+        """
+        INSERT INTO sessions
+        (id, source, session_source, title, model, started_at,
+         last_activity_at, message_count, parent_session_id, ended_at, end_reason)
+        VALUES ('modern_null_timestamp', 'cli', 'cli', 'Null timestamp',
+                'openai/gpt-5', ?, ?, 1, NULL, NULL, NULL)
+        """,
+        (newest, newest),
+    )
+    conn.execute(
+        "INSERT INTO messages(session_id, role, content, timestamp) VALUES ('modern_null_timestamp', 'user', 'hello', NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    rows = agent_sessions.read_importable_agent_session_rows(db, limit=1, exclude_sources=("webui",))
+
+    assert rows[0]["id"] == "modern_null_timestamp"
+
+
 def test_importable_agent_rows_zero_limit_skips_query_work(tmp_path):
     db = tmp_path / "state.db"
     _make_state_db(db, sessions=5, messages_per_session=1)
