@@ -485,15 +485,33 @@ def read_importable_agent_session_rows(
             join_clause = ""
             group_by_clause = ""
 
+        # Modern Hermes Agent databases carry ``sessions.last_activity_at``.
+        # Use a grouped, index-backed messages projection as the candidate
+        # source in that schema instead of scanning every wide ``sessions`` row
+        # and running a correlated subquery for each one. Session rows can carry
+        # large system-prompt/origin payloads, so that table scan makes the
+        # first sidebar request read the whole state.db from cold storage.
+        # Legacy schemas keep the correlated query for compatibility.
+        fast_message_candidates = (
+            use_messages_join
+            and messages_has_timestamp
+            and 'last_activity_at' in session_cols
+        )
         if use_messages_join and messages_has_timestamp:
             order_by_clause = "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC"
-            candidate_order_clause = (
-                "ORDER BY COALESCE(\n"
-                "                        (SELECT MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id),\n"
-                "                        s.started_at\n"
-                "                    ) DESC,\n"
-                "                    s.started_at DESC"
-            )
+            if fast_message_candidates:
+                candidate_order_clause = (
+                    "ORDER BY lm.last_message_at DESC,\n"
+                    "                    s.started_at DESC"
+                )
+            else:
+                candidate_order_clause = (
+                    "ORDER BY COALESCE(\n"
+                    "                        (SELECT MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id),\n"
+                    "                        s.started_at\n"
+                    "                    ) DESC,\n"
+                    "                    s.started_at DESC"
+                )
         else:
             order_by_clause = "ORDER BY s.started_at DESC"
             candidate_order_clause = "ORDER BY s.started_at DESC"
@@ -539,8 +557,23 @@ def read_importable_agent_session_rows(
             # Oversampling preserves room for hidden compression segments or
             # other rows filtered after projection.
             candidate_limit = max(result_limit * 8, result_limit)
-            cur.execute(
-                f"""
+            if fast_message_candidates:
+                candidate_cte = f"""
+                WITH latest_messages AS (
+                    SELECT mx.session_id, MAX(mx.timestamp) AS last_message_at
+                    FROM messages mx
+                    GROUP BY mx.session_id
+                ), candidates AS (
+                    SELECT lm.session_id AS id
+                    FROM latest_messages lm
+                    JOIN sessions s ON s.id = lm.session_id
+                    WHERE {' AND '.join(where_clauses)}
+                    {candidate_order_clause}
+                    LIMIT ?
+                )
+                """
+            else:
+                candidate_cte = f"""
                 WITH candidates AS (
                     SELECT s.id
                     FROM sessions s
@@ -548,6 +581,10 @@ def read_importable_agent_session_rows(
                     {candidate_order_clause}
                     LIMIT ?
                 )
+                """
+            cur.execute(
+                f"""
+                {candidate_cte}
                 {select_sql}
                 FROM sessions s
                 JOIN candidates c ON c.id = s.id
