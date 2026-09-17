@@ -45,10 +45,12 @@ def test_curated_provider_models_keep_operator_routing():
         "k3",
     } & {m["id"] for m in config._PROVIDER_MODELS["zai"]}
     kimi = config._PROVIDER_MODELS["kimi-coding"]
-    assert [(m["id"], m["label"]) for m in kimi[-3:]] == [
+    assert [(m["id"], m["label"]) for m in kimi[3:8]] == [
+        ("kimi-latest", "Kimi Latest"),
         ("kimi-for-coding", "Kimi For Coding"),
         ("kimi-for-coding-highspeed", "Kimi For Coding Highspeed"),
         ("k3", "Kimi K3"),
+        ("kimi-k2.5", "Kimi K2.5"),
     ]
 
 
@@ -64,9 +66,9 @@ def test_live_provider_models_append_curated_entries_once(monkeypatch):
         "moonshot-v1-32k",
         "moonshot-v1-128k",
         "kimi-latest",
-        "kimi-k2.5",
         "kimi-for-coding",
         "kimi-for-coding-highspeed",
+        "kimi-k2.5",
     ]
 
 
