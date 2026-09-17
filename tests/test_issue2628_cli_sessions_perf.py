@@ -223,7 +223,7 @@ def test_modern_candidate_projection_keeps_resumed_old_session(tmp_path):
     assert chain["_lineage_root_id"] == "modern_chain_root"
     assert chain["_compression_segment_count"] == 2
     src = (REPO_ROOT / "api" / "agent_sessions.py").read_text()
-    assert "WITH latest_messages AS" in src
+    assert "latest_messages AS" in src
     assert "FROM latest_messages lm" in src
     assert "message_candidates_raw" in src
     assert "CROSS JOIN sessions s ON s.id = mc.id" in src
@@ -259,6 +259,35 @@ def test_modern_candidate_projection_filters_excluded_sources_before_limit(tmp_p
     )
 
     assert rows[0]["id"] == "modern_resumed_old"
+
+
+def test_modern_candidate_projection_keeps_message_count_mismatch_candidate(monkeypatch, tmp_path):
+    """A stale positive count must not hide a session with no message rows."""
+    db = tmp_path / "state.db"
+    _make_modern_state_db(db)
+    conn = sqlite3.connect(str(db))
+    started = time.time() + 120
+    conn.execute(
+        """
+        INSERT INTO sessions
+        (id, source, session_source, title, model, started_at,
+         last_activity_at, message_count, parent_session_id, ended_at, end_reason)
+        VALUES ('modern_message_count_mismatch', 'cli', 'cli',
+                'Useful recovered conversation', 'openai/gpt-5', ?, ?,
+                3, NULL, NULL, NULL)
+        """,
+        (started, started),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(agent_sessions, "_project_agent_session_rows", lambda rows: rows)
+    monkeypatch.setattr(agent_sessions, "is_cli_session_row_visible", lambda row: True)
+    rows = agent_sessions.read_importable_agent_session_rows(
+        db, limit=1, exclude_sources=("webui",)
+    )
+
+    assert rows[0]["id"] == "modern_message_count_mismatch"
 
 
 def test_modern_candidate_projection_limits_before_wide_session_lookup(tmp_path):
@@ -305,6 +334,53 @@ def test_modern_candidate_projection_limits_before_wide_session_lookup(tmp_path)
 
     details = [row[3] for row in plan]
     assert any("SEARCH s USING INDEX sqlite_autoindex_sessions_1 (id=?)" in detail for detail in details)
+    assert not any(detail == "SCAN s" for detail in details)
+
+
+def test_modern_candidate_projection_full_query_has_no_wide_session_scan(monkeypatch, tmp_path):
+    """The exact production CTE must keep empty candidates index-bounded."""
+    db = tmp_path / "state.db"
+    _make_modern_state_db(db)
+    captured = []
+    real_connect = sqlite3.connect
+
+    class CapturingCursor:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def execute(self, sql, params=()):
+            if "latest_messages AS" in sql:
+                captured.append((sql, tuple(params)))
+            self._cursor.execute(sql, params)
+            return self
+
+        def fetchall(self):
+            return self._cursor.fetchall()
+
+        def __getattr__(self, name):
+            return getattr(self._cursor, name)
+
+    class CapturingConnection(sqlite3.Connection):
+        def cursor(self, *args, **kwargs):
+            return CapturingCursor(super().cursor(*args, **kwargs))
+
+    def capturing_connect(*args, **kwargs):
+        kwargs["factory"] = CapturingConnection
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(agent_sessions.sqlite3, "connect", capturing_connect)
+    agent_sessions.read_importable_agent_session_rows(
+        db, limit=20, exclude_sources=("webui",)
+    )
+    assert captured
+    sql, params = captured[-1]
+
+    conn = real_connect(str(db))
+    details = [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)]
+    conn.close()
+
+    assert any("SCAN s USING COVERING INDEX idx_sessions_started" in detail for detail in details)
+    assert any("SEARCH s USING INTEGER PRIMARY KEY" in detail for detail in details)
     assert not any(detail == "SCAN s" for detail in details)
 
 

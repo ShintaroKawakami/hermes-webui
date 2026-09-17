@@ -497,10 +497,11 @@ def read_importable_agent_session_rows(
         # and running a correlated subquery for each one. Session rows can carry
         # large system-prompt/origin payloads, so that table scan makes the
         # first sidebar request read the whole state.db from cold storage. A
-        # separate indexed empty-row candidate set keeps compression lineage
-        # intact. The rejected alternative is a modern-schema LEFT JOIN from
-        # ``sessions``: it still scans the wide table before sorting. Legacy
-        # schemas keep the correlated query for compatibility.
+        # bounded indexed empty-row window plus parent-ID walk keeps compression
+        # lineage intact without reopening a wide-table scan. The rejected
+        # alternative is a modern-schema LEFT JOIN from ``sessions``: it still
+        # scans the wide table before sorting. Legacy schemas keep the
+        # correlated query for compatibility.
         fast_message_candidates = (
             use_messages_join
             and messages_has_timestamp
@@ -580,8 +581,9 @@ def read_importable_agent_session_rows(
                 raw_source_where = " AND ".join(
                     clause.replace("s.", "sf.", 1) for clause in where_clauses
                 )
+                empty_scan_limit = max(candidate_limit * 8, candidate_limit)
                 candidate_cte = f"""
-                WITH latest_messages AS (
+                WITH RECURSIVE latest_messages AS (
                     SELECT mx.session_id, MAX(mx.timestamp) AS last_message_at
                     FROM messages mx
                     GROUP BY mx.session_id
@@ -598,8 +600,9 @@ def read_importable_agent_session_rows(
                     LIMIT ?
                 ), null_message_candidates AS (
                     SELECT lm.session_id AS id, lm.last_message_at
+                           , s.started_at
                     FROM latest_messages lm
-                    JOIN sessions s ON s.id = lm.session_id
+                    CROSS JOIN sessions s ON s.id = lm.session_id
                     WHERE lm.last_message_at IS NULL
                       AND {' AND '.join(where_clauses)}
                     ORDER BY s.started_at DESC
@@ -616,20 +619,37 @@ def read_importable_agent_session_rows(
                     ORDER BY COALESCE(mc.last_message_at, s.started_at) DESC,
                              s.started_at DESC
                     LIMIT ?
+                ), empty_candidate_rows AS (
+                    SELECT s.rowid AS session_rowid
+                    FROM sessions s INDEXED BY idx_sessions_started
+                    ORDER BY s.started_at DESC
+                    LIMIT ?
                 ), empty_candidates AS (
                     SELECT s.id, NULL AS last_message_at, s.started_at
-                    FROM sessions s
+                    FROM empty_candidate_rows ec
+                    CROSS JOIN sessions s ON s.rowid = ec.session_rowid
                     WHERE {' AND '.join(where_clauses)}
-                      AND COALESCE(s.message_count, 0) <= 0
                       AND NOT EXISTS (
                           SELECT 1 FROM messages m0 WHERE m0.session_id = s.id
                       )
                     ORDER BY s.started_at DESC
                     LIMIT ?
+                ), lineage_candidates(id) AS (
+                    SELECT s.parent_session_id
+                    FROM message_candidates mc
+                    CROSS JOIN sessions s ON s.id = mc.id
+                    WHERE s.parent_session_id IS NOT NULL
+                    UNION
+                    SELECT s.parent_session_id
+                    FROM lineage_candidates lc
+                    CROSS JOIN sessions s ON s.id = lc.id
+                    WHERE s.parent_session_id IS NOT NULL
                 ), candidates AS (
-                    SELECT id, last_message_at, started_at FROM message_candidates
-                    UNION ALL
-                    SELECT id, last_message_at, started_at FROM empty_candidates
+                    SELECT id FROM message_candidates
+                    UNION
+                    SELECT id FROM empty_candidates
+                    UNION
+                    SELECT id FROM lineage_candidates
                 )
                 """
                 candidate_params = [
@@ -639,8 +659,10 @@ def read_importable_agent_session_rows(
                     candidate_limit,
                     *params,
                     candidate_limit,
+                    empty_scan_limit,
                     *params,
                     candidate_limit,
+                    *params,
                 ]
             else:
                 candidate_cte = f"""
@@ -652,7 +674,7 @@ def read_importable_agent_session_rows(
                     LIMIT ?
                 )
                 """
-                candidate_params = [*params, candidate_limit]
+                candidate_params = [*params, candidate_limit, *params]
             cur.execute(
                 f"""
                 {candidate_cte}
@@ -660,6 +682,7 @@ def read_importable_agent_session_rows(
                 FROM candidates c
                 CROSS JOIN sessions s ON s.id = c.id
                 {join_clause}
+                WHERE {' AND '.join(where_clauses)}
                 {group_by_clause}
                 {order_by_clause}
                 """,
