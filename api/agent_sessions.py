@@ -43,6 +43,17 @@ def _install_read_query_deadline(conn):
         return False
     return True
 
+
+def _fetch_bounded_read_rows(conn, cur, query: str, params: list[object]) -> list:
+    """Execute a bounded read and keep its deadline through ``fetchall``."""
+    query_deadline_installed = _install_read_query_deadline(conn)
+    try:
+        cur.execute(query, params)
+        return cur.fetchall()
+    finally:
+        if query_deadline_installed:
+            conn.set_progress_handler(None, 0)
+
 SOURCE_LABELS = {
     'api_server': 'API',
     'cli': 'CLI',
@@ -762,8 +773,9 @@ def read_importable_agent_session_rows(
                 )
                 """
                 candidate_params = [*params, candidate_limit, *params]
-            query_deadline_installed = _install_read_query_deadline(conn)
-            cur.execute(
+            projected_rows = _fetch_bounded_read_rows(
+                conn,
+                cur,
                 f"""
                 {candidate_cte}
                 {select_sql}
@@ -776,11 +788,10 @@ def read_importable_agent_session_rows(
                 """,
                 candidate_params,
             )
-            if query_deadline_installed:
-                conn.set_progress_handler(None, 0)
         else:
-            query_deadline_installed = _install_read_query_deadline(conn)
-            cur.execute(
+            projected_rows = _fetch_bounded_read_rows(
+                conn,
+                cur,
                 f"""
                 {select_sql}
                 FROM sessions s
@@ -791,9 +802,7 @@ def read_importable_agent_session_rows(
                 """,
                 params,
             )
-            if query_deadline_installed:
-                conn.set_progress_handler(None, 0)
-        projected = _project_agent_session_rows([dict(row) for row in cur.fetchall()])
+        projected = _project_agent_session_rows([dict(row) for row in projected_rows])
         projected = [_with_normalized_source(row) for row in projected]
         projected = [row for row in projected if is_cli_session_row_visible(row)]
         if limit is None:
