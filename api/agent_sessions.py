@@ -22,7 +22,8 @@ CLI_MIN_UNTITLED_USER_MESSAGE_COUNT = 2
 
 # [fix] 2026-09-18: bound agent-state reads for the mobile session-list path.
 # The default SQLite busy timeout lets the agent writer hold /api/sessions for
-# seconds, which makes Hermex fall back to its offline cache.  Increasing the
+# seconds, which makes the Hermes mobile client fall back to its offline cache.
+# Increasing the
 # wait or adding retry/DDL would extend the request and contend with that same
 # writer; these rows are additive, so skipping them for one poll and refreshing
 # on the next poll preserves the native WebUI sessions safely.
