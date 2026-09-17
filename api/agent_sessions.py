@@ -503,13 +503,12 @@ def read_importable_agent_session_rows(
         # scans the wide table before sorting. Legacy schemas keep the
         # correlated query for compatibility.
         fast_message_candidates = (
-            use_messages_join
-            and messages_has_timestamp
-            and 'last_activity_at' in session_cols
-            and 'idx_messages_session' in message_indexes
-            and 'idx_sessions_effective_activity' in session_indexes
-            and 'idx_sessions_started' in session_indexes
-        )
+                use_messages_join
+                and messages_has_timestamp
+                and 'last_activity_at' in session_cols
+                and 'idx_messages_session' in message_indexes
+                and 'idx_sessions_started' in session_indexes
+            )
         if use_messages_join and messages_has_timestamp:
             order_by_clause = "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC"
             if fast_message_candidates:
