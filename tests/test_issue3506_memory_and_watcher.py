@@ -553,6 +553,30 @@ def test_poll_loop_skips_projection_when_unchanged(tmp_path, monkeypatch):
     assert calls["n"] == 2, "expensive projection must run again after a real change"
 
 
+def test_poll_loop_gives_initial_webui_request_a_head_start(monkeypatch):
+    """Startup must not race the first cold /api/sessions projection."""
+    gw = importlib.import_module("api.gateway_watcher")
+    watcher = gw.GatewayWatcher()
+    waits = []
+    polls = []
+
+    class StopAfterInitialWait:
+        def wait(self, seconds):
+            waits.append(seconds)
+            return True
+
+        def is_set(self):
+            return True
+
+    watcher._stop_event = StopAfterInitialWait()
+    monkeypatch.setattr(watcher, "_poll_once", lambda: polls.append(True))
+
+    watcher._poll_loop()
+
+    assert waits == [gw.GatewayWatcher.INITIAL_POLL_DELAY]
+    assert polls == []
+
+
 def test_lru_eviction_skips_active_runs():
     """Regression (#3536 review round 2): lowering SESSION_AGENT_CACHE_MAX (50→25)
     makes LRU agent-cache eviction more likely to fire, so the eviction loop must
