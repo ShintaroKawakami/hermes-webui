@@ -78,6 +78,7 @@ def _make_modern_state_db(path, *, sessions=80):
         CREATE INDEX idx_sessions_effective_activity
             ON sessions(COALESCE(last_activity_at, started_at) DESC, started_at DESC);
         CREATE INDEX idx_sessions_started ON sessions(started_at DESC);
+        CREATE INDEX idx_sessions_source_id ON sessions(source, id);
         CREATE TABLE messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT,
@@ -420,9 +421,30 @@ def test_modern_candidate_projection_full_query_has_no_wide_session_scan(monkeyp
     details = [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)]
     conn.close()
 
-    assert any("SCAN s USING INDEX idx_sessions_started" in detail for detail in details)
+    assert any(
+        "SCAN s USING" in detail and "idx_sessions_started" in detail
+        for detail in details
+    )
     assert any("SEARCH s USING INTEGER PRIMARY KEY" in detail for detail in details)
+    assert any("COVERING INDEX idx_sessions_source_id" in detail for detail in details)
     assert not any(detail == "SCAN s" for detail in details)
+
+
+def test_modern_candidate_projection_does_not_require_effective_activity_index(tmp_path):
+    """The modern CTE uses message/source/started indexes, not this legacy sort index."""
+    db = tmp_path / "state.db"
+    _make_modern_state_db(db)
+    conn = sqlite3.connect(str(db))
+    conn.execute("DROP INDEX idx_sessions_effective_activity")
+    conn.commit()
+    conn.close()
+
+    rows = agent_sessions.read_importable_agent_session_rows(
+        db, limit=20, exclude_sources=("webui",)
+    )
+
+    assert rows
+    assert rows[0]["id"] == "modern_resumed_old"
 
 
 def test_modern_candidate_projection_falls_back_to_started_at_for_null_timestamp(tmp_path):

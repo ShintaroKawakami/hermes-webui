@@ -503,13 +503,12 @@ def read_importable_agent_session_rows(
         # scans the wide table before sorting. Legacy schemas keep the
         # correlated query for compatibility.
         fast_message_candidates = (
-            use_messages_join
-            and messages_has_timestamp
-            and 'last_activity_at' in session_cols
-            and 'idx_messages_session' in message_indexes
-            and 'idx_sessions_effective_activity' in session_indexes
-            and 'idx_sessions_started' in session_indexes
-        )
+                use_messages_join
+                and messages_has_timestamp
+                and 'last_activity_at' in session_cols
+                and 'idx_messages_session' in message_indexes
+                and 'idx_sessions_started' in session_indexes
+            )
         if use_messages_join and messages_has_timestamp:
             order_by_clause = "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC"
             if fast_message_candidates:
@@ -581,21 +580,54 @@ def read_importable_agent_session_rows(
                 raw_source_where = " AND ".join(
                     clause.replace("s.", "sf.", 1) for clause in where_clauses
                 )
+                # [perf] 2026-09-18: The iPhone sidebar must stay responsive
+                # on a cold Mac mini state.db while the read-only hot path
+                # remains safe for the active gateway writer. Use the modern
+                # (source, id) covering index for source gates so wide session
+                # rows are fetched only after candidate IDs are bounded.
+                # Older databases keep the validated EXISTS fallback, and we
+                # reject retaining the old activity-index gate because this
+                # CTE does not use that index and would disable the fast path
+                # unnecessarily.
+                source_index_available = "idx_sessions_source_id" in session_indexes
+                if source_index_available:
+                    source_lookup_cte = f"""
+                ), allowed_session_rows AS (
+                    SELECT sf.rowid AS session_rowid, sf.id
+                    FROM sessions sf INDEXED BY idx_sessions_source_id
+                    WHERE {raw_source_where}
+                """
+                    raw_source_join = "JOIN allowed_session_rows allowed ON allowed.id = lm.session_id"
+                    raw_source_filter = ""
+                    empty_rows_filter = (
+                        "s.rowid IN (SELECT session_rowid FROM allowed_session_rows)"
+                    )
+                    raw_source_params = params
+                    empty_rows_params = []
+                else:
+                    source_lookup_cte = ""
+                    raw_source_join = ""
+                    raw_source_filter = f"""
+                      AND EXISTS (
+                          SELECT 1 FROM sessions sf
+                          WHERE sf.id = lm.session_id
+                            AND {raw_source_where}
+                      )"""
+                    empty_rows_filter = " AND ".join(where_clauses)
+                    raw_source_params = params
+                    empty_rows_params = params
                 empty_scan_limit = max(candidate_limit * 8, candidate_limit)
                 candidate_cte = f"""
                 WITH RECURSIVE latest_messages AS (
                     SELECT mx.session_id, MAX(mx.timestamp) AS last_message_at
                     FROM messages mx
                     GROUP BY mx.session_id
-                ), message_candidates_raw AS (
+                {source_lookup_cte}), message_candidates_raw AS (
                     SELECT lm.session_id AS id, lm.last_message_at
                     FROM latest_messages lm
+                    {raw_source_join}
                     WHERE lm.last_message_at IS NOT NULL
-                      AND EXISTS (
-                          SELECT 1 FROM sessions sf
-                          WHERE sf.id = lm.session_id
-                            AND {raw_source_where}
-                      )
+                    {raw_source_filter}
                     ORDER BY lm.last_message_at DESC
                     LIMIT ?
                 ), null_message_candidates AS (
@@ -622,7 +654,7 @@ def read_importable_agent_session_rows(
                 ), empty_candidate_rows AS (
                     SELECT s.rowid AS session_rowid
                     FROM sessions s INDEXED BY idx_sessions_started
-                    WHERE {' AND '.join(where_clauses)}
+                    WHERE {empty_rows_filter}
                     ORDER BY s.started_at DESC
                     LIMIT ?
                 ), empty_candidates AS (
@@ -654,13 +686,13 @@ def read_importable_agent_session_rows(
                 )
                 """
                 candidate_params = [
-                    *params,
+                    *raw_source_params,
                     candidate_limit,
                     *params,
                     candidate_limit,
                     *params,
                     candidate_limit,
-                    *params,
+                    *empty_rows_params,
                     empty_scan_limit,
                     *params,
                     candidate_limit,
