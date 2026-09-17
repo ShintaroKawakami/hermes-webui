@@ -186,6 +186,14 @@ class GatewayWatcher:
     """
 
     POLL_INTERVAL = 5  # seconds between polls
+    # [2026-09-18][fix] The first projection is the coldest read of the agent's
+    # state.db. Starting it at the same instant as the WebUI's first
+    # ``/api/sessions`` request makes two wide SQLite readers compete for disk
+    # pages on the Mac mini and leaves the iPhone on its cached/offline view.
+    # Give the request path a short head start; subsequent polls use the
+    # existing cheap fingerprint gate. A longer startup barrier would delay
+    # gateway SSE updates without improving the sidebar request.
+    INITIAL_POLL_DELAY = 15.0
     # [2026-09-17][fix] The iPhone cached/offline incident showed that a
     # role-inclusive five-second scan can block the sessions request on a large
     # messages table. Keep role out of the hot query and use the bounded parity
@@ -337,6 +345,8 @@ class GatewayWatcher:
 
     def _poll_loop(self):
         """Main polling loop. Runs in a daemon thread."""
+        if self._stop_event.wait(self.INITIAL_POLL_DELAY):
+            return
         while not self._stop_event.is_set():
             try:
                 self._poll_once()
