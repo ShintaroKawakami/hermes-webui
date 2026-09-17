@@ -55,6 +55,21 @@ def test_profiles_match_default_alias_treated_as_root(monkeypatch):
     assert _profiles_match('kinni', 'haku') is False
 
 
+def test_profiles_match_root_lookup_skips_full_profile_skill_scan(monkeypatch):
+    """Sidebar matching must not build full profile metadata on a cold cache."""
+    import api.profiles as p
+    from api.routes import _profiles_match
+
+    p._invalidate_root_profile_cache()
+    monkeypatch.setattr(
+        p,
+        '_get_profile_skills_stats',
+        lambda *_args, **_kwargs: pytest.fail('skill scan must not run'),
+    )
+
+    assert _profiles_match('haku', 'default') is False
+
+
 def test_profiles_match_empty_row_treated_as_root():
     """A row with no profile tag (None or empty string) is treated as root.
 
