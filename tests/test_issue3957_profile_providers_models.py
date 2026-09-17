@@ -46,9 +46,9 @@ def test_curated_provider_models_keep_operator_routing():
     } & {m["id"] for m in config._PROVIDER_MODELS["zai"]}
     kimi = config._PROVIDER_MODELS["kimi-coding"]
     assert [(m["id"], m["label"]) for m in kimi[-3:]] == [
-        ("kimi-for-coding", "Kimi for Coding"),
-        ("kimi-for-coding-highspeed", "Kimi for Coding Highspeed"),
-        ("k3", "K3"),
+        ("kimi-for-coding", "Kimi For Coding"),
+        ("kimi-for-coding-highspeed", "Kimi For Coding Highspeed"),
+        ("k3", "Kimi K3"),
     ]
 
 
