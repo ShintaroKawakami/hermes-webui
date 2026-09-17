@@ -229,6 +229,38 @@ def test_modern_candidate_projection_keeps_resumed_old_session(tmp_path):
     assert "CROSS JOIN sessions s ON s.id = mc.id" in src
 
 
+def test_modern_candidate_projection_filters_excluded_sources_before_limit(tmp_path):
+    """Excluded recent rows must not consume the bounded candidate window."""
+    db = tmp_path / "state.db"
+    _make_modern_state_db(db)
+    conn = sqlite3.connect(str(db))
+    base = time.time() + 1000
+    for i in range(20):
+        sid = f"modern_webui_{i:02d}"
+        started = base + i
+        conn.execute(
+            """
+            INSERT INTO sessions
+            (id, source, session_source, title, model, started_at,
+             last_activity_at, message_count, parent_session_id, ended_at, end_reason)
+            VALUES (?, 'webui', 'webui', ?, 'openai/gpt-5', ?, ?, 1, NULL, NULL, NULL)
+            """,
+            (sid, sid, started, started),
+        )
+        conn.execute(
+            "INSERT INTO messages(session_id, role, content, timestamp) VALUES (?, 'user', 'hidden', ?)",
+            (sid, started),
+        )
+    conn.commit()
+    conn.close()
+
+    rows = agent_sessions.read_importable_agent_session_rows(
+        db, limit=1, exclude_sources=("webui",)
+    )
+
+    assert rows[0]["id"] == "modern_resumed_old"
+
+
 def test_modern_candidate_projection_limits_before_wide_session_lookup(tmp_path):
     """The modern candidate plan must fetch wide session rows by candidate ID."""
     db = tmp_path / "state.db"
@@ -245,6 +277,11 @@ def test_modern_candidate_projection_limits_before_wide_session_lookup(tmp_path)
             SELECT lm.session_id AS id, lm.last_message_at
             FROM latest_messages lm
             WHERE lm.last_message_at IS NOT NULL
+              AND EXISTS (
+                  SELECT 1 FROM sessions sf
+                  WHERE sf.id = lm.session_id
+                    AND sf.source IS NOT NULL
+              )
             ORDER BY lm.last_message_at DESC
             LIMIT ?
         ), message_candidates AS (

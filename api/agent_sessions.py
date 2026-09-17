@@ -573,11 +573,13 @@ def read_importable_agent_session_rows(
                 # The grouped message timestamps are narrow enough to scan on
                 # a cold state.db, but joining every grouped session back to
                 # the wide ``sessions`` table before LIMIT defeats that win.
-                # Take a larger ID-only window first, then fetch session rows
-                # for the surviving candidates.  The extra headroom absorbs
-                # excluded sources and compression rows without restoring a
-                # full wide-table sort.
-                candidate_scan_limit = max(candidate_limit * 8, candidate_limit)
+                # Filter sources through indexed ID lookups, take an ID-only
+                # window first, then fetch session rows for the survivors.
+                # The candidate headroom absorbs projection and compression
+                # rows without restoring a full wide-table sort.
+                raw_source_where = " AND ".join(
+                    clause.replace("s.", "sf.", 1) for clause in where_clauses
+                )
                 candidate_cte = f"""
                 WITH latest_messages AS (
                     SELECT mx.session_id, MAX(mx.timestamp) AS last_message_at
@@ -587,6 +589,11 @@ def read_importable_agent_session_rows(
                     SELECT lm.session_id AS id, lm.last_message_at
                     FROM latest_messages lm
                     WHERE lm.last_message_at IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1 FROM sessions sf
+                          WHERE sf.id = lm.session_id
+                            AND {raw_source_where}
+                      )
                     ORDER BY lm.last_message_at DESC
                     LIMIT ?
                 ), null_message_candidates AS (
@@ -594,6 +601,7 @@ def read_importable_agent_session_rows(
                     FROM latest_messages lm
                     JOIN sessions s ON s.id = lm.session_id
                     WHERE lm.last_message_at IS NULL
+                      AND {' AND '.join(where_clauses)}
                     ORDER BY s.started_at DESC
                     LIMIT ?
                 ), message_candidates AS (
@@ -625,8 +633,10 @@ def read_importable_agent_session_rows(
                 )
                 """
                 candidate_params = [
-                    candidate_scan_limit,
-                    candidate_scan_limit,
+                    *params,
+                    candidate_limit,
+                    *params,
+                    candidate_limit,
                     *params,
                     candidate_limit,
                     *params,
