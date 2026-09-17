@@ -431,6 +431,10 @@ def read_importable_agent_session_rows(
         session_cols = {row[1] for row in cur.fetchall()}
         cur.execute("PRAGMA table_info(messages)")
         message_cols = {row[1] for row in cur.fetchall()}
+        cur.execute("PRAGMA index_list(sessions)")
+        session_indexes = {row[1] for row in cur.fetchall()}
+        cur.execute("PRAGMA index_list(messages)")
+        message_indexes = {row[1] for row in cur.fetchall()}
         if 'source' not in session_cols:
             log.warning(
                 "agent session listing skipped: state.db at %s has no 'source' column "
@@ -485,15 +489,42 @@ def read_importable_agent_session_rows(
             join_clause = ""
             group_by_clause = ""
 
+        # [fix] 2026-09-18: modern Hermes Agent databases carry
+        # ``sessions.last_activity_at``. The sidebar must remain responsive on
+        # a cold Mac mini state.db while preserving empty compression segments.
+        # Use a grouped, index-backed messages projection as the candidate
+        # source in that schema instead of scanning every wide ``sessions`` row
+        # and running a correlated subquery for each one. Session rows can carry
+        # large system-prompt/origin payloads, so that table scan makes the
+        # first sidebar request read the whole state.db from cold storage. A
+        # bounded indexed empty-row window plus parent-ID walk keeps compression
+        # lineage intact without reopening a wide-table scan. The rejected
+        # alternative is a modern-schema LEFT JOIN from ``sessions``: it still
+        # scans the wide table before sorting. Legacy schemas keep the
+        # correlated query for compatibility.
+        fast_message_candidates = (
+            use_messages_join
+            and messages_has_timestamp
+            and 'last_activity_at' in session_cols
+            and 'idx_messages_session' in message_indexes
+            and 'idx_sessions_effective_activity' in session_indexes
+            and 'idx_sessions_started' in session_indexes
+        )
         if use_messages_join and messages_has_timestamp:
             order_by_clause = "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC"
-            candidate_order_clause = (
-                "ORDER BY COALESCE(\n"
-                "                        (SELECT MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id),\n"
-                "                        s.started_at\n"
-                "                    ) DESC,\n"
-                "                    s.started_at DESC"
-            )
+            if fast_message_candidates:
+                candidate_order_clause = (
+                    "ORDER BY COALESCE(lm.last_message_at, s.started_at) DESC,\n"
+                    "                    s.started_at DESC"
+                )
+            else:
+                candidate_order_clause = (
+                    "ORDER BY COALESCE(\n"
+                    "                        (SELECT MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id),\n"
+                    "                        s.started_at\n"
+                    "                    ) DESC,\n"
+                    "                    s.started_at DESC"
+                )
         else:
             order_by_clause = "ORDER BY s.started_at DESC"
             candidate_order_clause = "ORDER BY s.started_at DESC"
@@ -539,8 +570,104 @@ def read_importable_agent_session_rows(
             # Oversampling preserves room for hidden compression segments or
             # other rows filtered after projection.
             candidate_limit = max(result_limit * 8, result_limit)
-            cur.execute(
-                f"""
+            if fast_message_candidates:
+                # The grouped message timestamps are narrow enough to scan on
+                # a cold state.db, but joining every grouped session back to
+                # the wide ``sessions`` table before LIMIT defeats that win.
+                # Filter sources through indexed ID lookups, take an ID-only
+                # window first, then fetch session rows for the survivors.
+                # The candidate headroom absorbs projection and compression
+                # rows without restoring a full wide-table sort.
+                raw_source_where = " AND ".join(
+                    clause.replace("s.", "sf.", 1) for clause in where_clauses
+                )
+                empty_scan_limit = max(candidate_limit * 8, candidate_limit)
+                candidate_cte = f"""
+                WITH RECURSIVE latest_messages AS (
+                    SELECT mx.session_id, MAX(mx.timestamp) AS last_message_at
+                    FROM messages mx
+                    GROUP BY mx.session_id
+                ), message_candidates_raw AS (
+                    SELECT lm.session_id AS id, lm.last_message_at
+                    FROM latest_messages lm
+                    WHERE lm.last_message_at IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1 FROM sessions sf
+                          WHERE sf.id = lm.session_id
+                            AND {raw_source_where}
+                      )
+                    ORDER BY lm.last_message_at DESC
+                    LIMIT ?
+                ), null_message_candidates AS (
+                    SELECT lm.session_id AS id, lm.last_message_at
+                           , s.started_at
+                    FROM latest_messages lm
+                    CROSS JOIN sessions s ON s.id = lm.session_id
+                    WHERE lm.last_message_at IS NULL
+                      AND {' AND '.join(where_clauses)}
+                    ORDER BY s.started_at DESC
+                    LIMIT ?
+                ), message_candidates AS (
+                    SELECT mc.id, mc.last_message_at, s.started_at
+                    FROM (
+                        SELECT id, last_message_at FROM message_candidates_raw
+                        UNION ALL
+                        SELECT id, last_message_at FROM null_message_candidates
+                    ) mc
+                    CROSS JOIN sessions s ON s.id = mc.id
+                    WHERE {' AND '.join(where_clauses)}
+                    ORDER BY COALESCE(mc.last_message_at, s.started_at) DESC,
+                             s.started_at DESC
+                    LIMIT ?
+                ), empty_candidate_rows AS (
+                    SELECT s.rowid AS session_rowid
+                    FROM sessions s INDEXED BY idx_sessions_started
+                    WHERE {' AND '.join(where_clauses)}
+                    ORDER BY s.started_at DESC
+                    LIMIT ?
+                ), empty_candidates AS (
+                    SELECT s.id, NULL AS last_message_at, s.started_at
+                    FROM empty_candidate_rows ec
+                    CROSS JOIN sessions s ON s.rowid = ec.session_rowid
+                    WHERE {' AND '.join(where_clauses)}
+                      AND NOT EXISTS (
+                          SELECT 1 FROM messages m0 WHERE m0.session_id = s.id
+                      )
+                    ORDER BY s.started_at DESC
+                    LIMIT ?
+                ), lineage_candidates(id) AS (
+                    SELECT s.parent_session_id
+                    FROM message_candidates mc
+                    CROSS JOIN sessions s ON s.id = mc.id
+                    WHERE s.parent_session_id IS NOT NULL
+                    UNION
+                    SELECT s.parent_session_id
+                    FROM lineage_candidates lc
+                    CROSS JOIN sessions s ON s.id = lc.id
+                    WHERE s.parent_session_id IS NOT NULL
+                ), candidates AS (
+                    SELECT id FROM message_candidates
+                    UNION
+                    SELECT id FROM empty_candidates
+                    UNION
+                    SELECT id FROM lineage_candidates
+                )
+                """
+                candidate_params = [
+                    *params,
+                    candidate_limit,
+                    *params,
+                    candidate_limit,
+                    *params,
+                    candidate_limit,
+                    *params,
+                    empty_scan_limit,
+                    *params,
+                    candidate_limit,
+                    *params,
+                ]
+            else:
+                candidate_cte = f"""
                 WITH candidates AS (
                     SELECT s.id
                     FROM sessions s
@@ -548,14 +675,20 @@ def read_importable_agent_session_rows(
                     {candidate_order_clause}
                     LIMIT ?
                 )
+                """
+                candidate_params = [*params, candidate_limit, *params]
+            cur.execute(
+                f"""
+                {candidate_cte}
                 {select_sql}
-                FROM sessions s
-                JOIN candidates c ON c.id = s.id
+                FROM candidates c
+                CROSS JOIN sessions s ON s.id = c.id
                 {join_clause}
+                WHERE {' AND '.join(where_clauses)}
                 {group_by_clause}
                 {order_by_clause}
                 """,
-                [*params, candidate_limit],
+                candidate_params,
             )
         else:
             cur.execute(
