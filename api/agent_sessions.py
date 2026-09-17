@@ -396,6 +396,7 @@ def read_importable_agent_session_rows(
     limit: int | None = 200,
     log=None,
     exclude_sources: tuple[str, ...] | None = ("cron", "webui"),
+    include_sources: tuple[str, ...] | None = None,
 ) -> list[dict]:
     """Return agent sessions projected as importable conversations.
 
@@ -410,6 +411,11 @@ def read_importable_agent_session_rows(
     views should stay focused on user-facing conversations, while callers that
     need a source-specific diagnostic view can opt out by passing
     ``exclude_sources=None``.
+
+    ``include_sources`` is an optional indexed source scope for callers such as
+    the cron project-chip pass. When supplied, only those raw source values are
+    projected; ``exclude_sources`` remains available for compatibility but is
+    applied after the include scope.
     """
     db_path = Path(db_path)
     if not db_path.exists():
@@ -536,6 +542,12 @@ def read_importable_agent_session_rows(
                 placeholders = ", ".join("?" for _ in excluded)
                 where_clauses.append(f"s.source NOT IN ({placeholders})")
                 params.extend(excluded)
+        if include_sources:
+            included = tuple(str(source) for source in include_sources if source)
+            if included:
+                placeholders = ", ".join("?" for _ in included)
+                where_clauses.append(f"s.source IN ({placeholders})")
+                params.extend(included)
 
         select_sql = f"""
             SELECT s.id, s.title, s.model, s.message_count,
@@ -568,7 +580,14 @@ def read_importable_agent_session_rows(
             # can be resumed days later and should still surface at the top.
             # Oversampling preserves room for hidden compression segments or
             # other rows filtered after projection.
-            candidate_limit = max(result_limit * 8, result_limit)
+            # [perf] 2026-09-18: The cron project-chip pass must not read
+            # unrelated wide session payloads merely to discard them later.
+            # Keep the normal sidebar's compression headroom, but use a
+            # smaller source-scoped margin after the source index has filtered
+            # the candidate set. Retaining the factor of eight for both paths
+            # would preserve the cold-start timeout this repair is addressing.
+            candidate_multiplier = 2 if include_sources else 8
+            candidate_limit = max(result_limit * candidate_multiplier, result_limit)
             if fast_message_candidates:
                 # The grouped message timestamps are narrow enough to scan on
                 # a cold state.db, but joining every grouped session back to
