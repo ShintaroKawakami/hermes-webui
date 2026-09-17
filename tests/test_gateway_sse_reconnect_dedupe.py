@@ -22,10 +22,11 @@ def _block(src: str, start: str, end: str) -> str:
 def test_gateway_watcher_remains_hash_only():
     """The watcher should not try to infer restarts from state.db mtime."""
     src = _read(GATEWAY_WATCHER)
-    poll = _block(src, "    def _poll_loop(self):", "\n_watcher:")
+    poll = _block(src, "    def _poll_once(self, *, now: float | None = None) -> bool:", "    def _poll_loop(self):")
 
     assert "_get_db_mtime" not in src
     assert "_detect_gateway_restart" not in src
+    assert "PROJECTION_PARITY_INTERVAL" in src
     assert "current_hash = _snapshot_hash(sessions)" in poll
     assert "if current_hash != self._last_hash:" in poll
     assert "_notify_subscribers(sessions)" in poll
