@@ -199,6 +199,12 @@ def _read_active_profile_file() -> str:
 _root_profile_name_cache: set[str] = {'default'}
 _root_profile_name_cache_lock = threading.Lock()
 _root_profile_name_cache_loaded = False
+# [fix] 2026-09-18: sidebar profile matching needs only the root identity, but
+# list_profiles_api() also computes every profile's skill counts. Keep the
+# thread-local lookup separate so /api/sessions stays responsive while the
+# normal profile-list metadata remains complete. Simplifying the public list
+# response was rejected because it would remove data used by the profile UI.
+_root_profile_lookup = threading.local()
 
 
 def _invalidate_root_profile_cache() -> None:
@@ -233,10 +239,16 @@ def _is_root_profile(name: str) -> bool:
     # Cache miss — populate from list_profiles_api(). Done outside the lock to
     # avoid holding it across a hermes_cli subprocess call.
     try:
+        _root_profile_lookup.active = True
         infos = list_profiles_api()
     except Exception:
         logger.debug("Failed to list profiles for root-profile lookup", exc_info=True)
         return False
+    finally:
+        try:
+            del _root_profile_lookup.active
+        except AttributeError:
+            pass
     with _root_profile_name_cache_lock:
         _root_profile_name_cache.clear()
         _root_profile_name_cache.add('default')
@@ -1260,6 +1272,17 @@ def list_profiles_api() -> list:
     """
     import time
     global _LIST_PROFILES_CACHE
+    if getattr(_root_profile_lookup, 'active', False):
+        # _is_root_profile() only consumes ``name`` and ``is_default``. Avoid
+        # the full skill-count scan here; the regular /api/profiles response
+        # still uses the complete cached metadata path below.
+        if not _DEFAULT_HERMES_HOME.is_dir():
+            return []
+        return [{
+            'name': 'default',
+            'path': str(_DEFAULT_HERMES_HOME),
+            'is_default': True,
+        }]
     with _LIST_PROFILES_CACHE_LOCK:
         now = time.time()
         cached = _LIST_PROFILES_CACHE
