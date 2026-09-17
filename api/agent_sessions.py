@@ -396,6 +396,7 @@ def read_importable_agent_session_rows(
     limit: int | None = 200,
     log=None,
     exclude_sources: tuple[str, ...] | None = ("cron", "webui"),
+    include_sources: tuple[str, ...] | None = None,
 ) -> list[dict]:
     """Return agent sessions projected as importable conversations.
 
@@ -410,10 +411,21 @@ def read_importable_agent_session_rows(
     views should stay focused on user-facing conversations, while callers that
     need a source-specific diagnostic view can opt out by passing
     ``exclude_sources=None``.
+
+    ``include_sources`` is an optional indexed source scope for callers such as
+    the cron project-chip pass. When supplied, only those raw source values are
+    projected; ``exclude_sources`` remains available for compatibility but is
+    applied after the include scope.
     """
     db_path = Path(db_path)
     if not db_path.exists():
         return []
+
+    included_sources = None
+    if include_sources is not None:
+        included_sources = tuple(str(source) for source in include_sources if source)
+        if not included_sources:
+            return []
 
     log = log or logger
     # [fix] CaD 2026-09-17: /api/sessions must not block on SQLite writes while
@@ -536,6 +548,10 @@ def read_importable_agent_session_rows(
                 placeholders = ", ".join("?" for _ in excluded)
                 where_clauses.append(f"s.source NOT IN ({placeholders})")
                 params.extend(excluded)
+        if included_sources is not None:
+            placeholders = ", ".join("?" for _ in included_sources)
+            where_clauses.append(f"s.source IN ({placeholders})")
+            params.extend(included_sources)
 
         select_sql = f"""
             SELECT s.id, s.title, s.model, s.message_count,
@@ -568,7 +584,15 @@ def read_importable_agent_session_rows(
             # can be resumed days later and should still surface at the top.
             # Oversampling preserves room for hidden compression segments or
             # other rows filtered after projection.
-            candidate_limit = max(result_limit * 8, result_limit)
+            # [perf] 2026-09-18: The cron project-chip pass must keep the
+            # iPhone sidebar responsive by applying its source condition before
+            # the candidate LIMIT, so unrelated wide payloads are never read.
+            # The normal sidebar keeps compression headroom; the source-scoped
+            # pass uses a factor of two. Keeping factor eight for both paths or
+            # filtering after LIMIT would retain the cold-start timeout, so
+            # those alternatives are rejected.
+            candidate_multiplier = 2 if include_sources else 8
+            candidate_limit = max(result_limit * candidate_multiplier, result_limit)
             if fast_message_candidates:
                 # The grouped message timestamps are narrow enough to scan on
                 # a cold state.db, but joining every grouped session back to

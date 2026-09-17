@@ -3911,14 +3911,12 @@ def _load_cli_sessions_uncached(hermes_home: Path, db_path: Path, _cli_profile) 
     # stay addressable under their project chip.
     existing_sids = {s['session_id'] for s in cli_sessions}
     try:
-        cron_excluded = tuple(
-            s for s in ('webui', 'claude-code')  # keep only 'cron'
-        )
         for row in read_importable_agent_session_rows(
             db_path,
             limit=CRON_PROJECT_CHIP_LIMIT,
             log=logger,
-            exclude_sources=cron_excluded,
+            exclude_sources=None,
+            include_sources=("cron",),
         ):
             sid = row['id']
             if sid in existing_sids:

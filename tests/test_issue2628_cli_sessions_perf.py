@@ -147,7 +147,7 @@ def test_importable_agent_rows_push_sidebar_limit_into_sql(tmp_path):
     assert "WITH candidates AS" in src
     assert "CROSS JOIN sessions s ON s.id = c.id" in src
     assert "SELECT MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id" in src
-    assert "candidate_limit = max(result_limit * 8, result_limit)" in src
+    assert "candidate_multiplier = 2 if include_sources else 8" in src
 
 
 def test_importable_agent_rows_limit_includes_resumed_old_session(tmp_path):
@@ -228,6 +228,7 @@ def test_modern_candidate_projection_keeps_resumed_old_session(tmp_path):
     assert "FROM latest_messages lm" in src
     assert "message_candidates_raw" in src
     assert "CROSS JOIN sessions s ON s.id = mc.id" in src
+    assert "candidate_multiplier = 2 if include_sources else 8" in src
 
 
 def test_modern_candidate_projection_filters_excluded_sources_before_limit(tmp_path):
@@ -260,6 +261,67 @@ def test_modern_candidate_projection_filters_excluded_sources_before_limit(tmp_p
     )
 
     assert rows[0]["id"] == "modern_resumed_old"
+
+
+def test_modern_candidate_projection_can_include_one_source_before_limit(tmp_path):
+    """A source-scoped pass must bound candidates before wide-row lookup."""
+    db = tmp_path / "state.db"
+    _make_modern_state_db(db)
+    conn = sqlite3.connect(str(db))
+    base = time.time() + 1000
+    for i in range(20):
+        sid = f"modern_cron_{i:02d}"
+        started = base + i
+        conn.execute(
+            """
+            INSERT INTO sessions
+            (id, source, session_source, title, model, started_at,
+             last_activity_at, message_count, parent_session_id, ended_at, end_reason)
+            VALUES (?, 'cron', 'cron', ?, 'openai/gpt-5', ?, ?, 1, NULL, NULL, NULL)
+            """,
+            (sid, sid, started, started),
+        )
+        conn.execute(
+            "INSERT INTO messages(session_id, role, content, timestamp) VALUES (?, 'user', 'cron', ?)",
+            (sid, started),
+        )
+    for i in range(20):
+        sid = f"modern_webui_newer_{i:02d}"
+        started = base + 100 + i
+        conn.execute(
+            """
+            INSERT INTO sessions
+            (id, source, session_source, title, model, started_at,
+             last_activity_at, message_count, parent_session_id, ended_at, end_reason)
+            VALUES (?, 'webui', 'webui', ?, 'openai/gpt-5', ?, ?, 1, NULL, NULL, NULL)
+            """,
+            (sid, sid, started, started),
+        )
+        conn.execute(
+            "INSERT INTO messages(session_id, role, content, timestamp) VALUES (?, 'user', 'webui', ?)",
+            (sid, started),
+        )
+    conn.commit()
+    conn.close()
+
+    rows = agent_sessions.read_importable_agent_session_rows(
+        db,
+        limit=1,
+        exclude_sources=None,
+        include_sources=("cron",),
+    )
+
+    assert rows[0]["id"] == "modern_cron_19"
+    assert {row["source"] for row in rows} == {"cron"}
+
+
+def test_importable_agent_rows_empty_source_scope_returns_empty(tmp_path):
+    db = tmp_path / "state.db"
+    _make_state_db(db, sessions=5, messages_per_session=1)
+
+    assert agent_sessions.read_importable_agent_session_rows(
+        db, include_sources=()
+    ) == []
 
 
 def test_modern_empty_candidates_filter_excluded_sources_before_limit(monkeypatch, tmp_path):
