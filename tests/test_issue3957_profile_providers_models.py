@@ -24,10 +24,50 @@ The fix:
 """
 
 import os
+import sys
+import types
 from pathlib import Path
 
 import api.config as config
 import api.profiles as profiles
+
+
+def test_curated_provider_models_keep_operator_routing():
+    """Kimi coding models belong to Kimi, while GLM-5.2 remains Z.AI."""
+    assert {
+        (m["provider"], m["id"])
+        for m in config._FALLBACK_MODELS
+    } >= {("Z.AI", "zai/glm-5.2")}
+    assert {m["id"] for m in config._PROVIDER_MODELS["zai"]} >= {"glm-5.2"}
+    assert not {
+        "kimi-for-coding",
+        "kimi-for-coding-highspeed",
+        "k3",
+    } & {m["id"] for m in config._PROVIDER_MODELS["zai"]}
+    kimi = config._PROVIDER_MODELS["kimi-coding"]
+    assert [(m["id"], m["label"]) for m in kimi[-3:]] == [
+        ("kimi-for-coding", "Kimi for Coding"),
+        ("kimi-for-coding-highspeed", "Kimi for Coding Highspeed"),
+        ("k3", "K3"),
+    ]
+
+
+def test_live_provider_models_append_curated_entries_once(monkeypatch):
+    """A live catalog stays first, then receives missing curated IDs once."""
+    fake_models = types.ModuleType("hermes_cli.models")
+    fake_models.provider_model_ids = lambda provider: ["live-model", "k3", "live-model"]
+    monkeypatch.setitem(sys.modules, "hermes_cli.models", fake_models)
+    assert config._read_live_provider_model_ids("kimi-coding") == [
+        "live-model",
+        "k3",
+        "moonshot-v1-8k",
+        "moonshot-v1-32k",
+        "moonshot-v1-128k",
+        "kimi-latest",
+        "kimi-k2.5",
+        "kimi-for-coding",
+        "kimi-for-coding-highspeed",
+    ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -248,4 +288,3 @@ def test_detached_worker_scope_binds_profile_on_new_thread(monkeypatch, tmp_path
     assert out["inside_env"] == "worker-env"
     assert out["after_name"] == "models_cache.json"  # restored
     assert out["after_env"] is None
-

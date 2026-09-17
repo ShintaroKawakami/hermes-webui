@@ -1320,8 +1320,6 @@ _PROVIDER_MODELS = {
         {"id": "@nous:google/gemini-3.1-pro-preview", "label": "Gemini 3.1 Pro Preview (via Nous)"},
     ],
     "zai": [
-        # [feat] CaD 2026-09-17: These models are served through the Z.AI endpoint,
-        # not the separate kimi-coding Moonshot API provider.
         {"id": "glm-5.2", "label": "GLM-5.2"},
         {"id": "glm-5.1", "label": "GLM-5.1"},
         {"id": "glm-5", "label": "GLM-5"},
@@ -1329,9 +1327,6 @@ _PROVIDER_MODELS = {
         {"id": "glm-4.7", "label": "GLM-4.7"},
         {"id": "glm-4.5", "label": "GLM-4.5"},
         {"id": "glm-4.5-flash", "label": "GLM-4.5 Flash"},
-        {"id": "kimi-for-coding", "label": "Kimi for Coding"},
-        {"id": "kimi-for-coding-highspeed", "label": "Kimi for Coding Highspeed"},
-        {"id": "k3", "label": "K3"},
     ],
     "kimi-coding": [
         {"id": "moonshot-v1-8k", "label": "Moonshot v1 8k"},
@@ -1339,6 +1334,9 @@ _PROVIDER_MODELS = {
         {"id": "moonshot-v1-128k", "label": "Moonshot v1 128k"},
         {"id": "kimi-latest", "label": "Kimi Latest"},
         {"id": "kimi-k2.5", "label": "Kimi K2.5"},
+        {"id": "kimi-for-coding", "label": "Kimi for Coding"},
+        {"id": "kimi-for-coding-highspeed", "label": "Kimi for Coding Highspeed"},
+        {"id": "k3", "label": "K3"},
     ],
     "minimax": [
         {"id": "MiniMax-M3", "label": "MiniMax M3"},
@@ -3694,9 +3692,9 @@ def _get_label_for_model(model_id: str, existing_groups: list) -> str:
 def _read_live_provider_model_ids(provider_id: str) -> list[str]:
     """Return live model IDs from Hermes CLI for a provider, or [] on failure.
 
-    WebUI's static ``_PROVIDER_MODELS`` table is only a fallback.  The agent CLI
-    owns the provider registry and catalog-discovery logic, so ordinary picker
-    groups should ask ``hermes_cli.models.provider_model_ids()`` first (#1240).
+    The agent CLI owns the provider registry and catalog-discovery logic, so
+    ordinary picker groups ask ``hermes_cli.models.provider_model_ids()`` first
+    (#1240), then append missing curated entries in table order.
     Provider aliases are tried as a secondary lookup because WebUI keeps a few
     display-facing IDs (for example ``google`` / ``x-ai``) that Hermes CLI may
     normalize internally.
@@ -3731,6 +3729,12 @@ def _read_live_provider_model_ids(provider_id: str) -> list[str]:
                 seen.add(mid_s)
                 result.append(mid_s)
         if result:
+            curated = _PROVIDER_MODELS.get(candidate, [])
+            for model in curated:
+                curated_id = str(model.get("id", "") or "").strip()
+                if curated_id and curated_id not in seen:
+                    seen.add(curated_id)
+                    result.append(curated_id)
             return result
     return []
 
@@ -3738,6 +3742,11 @@ def _read_live_provider_model_ids(provider_id: str) -> list[str]:
 def _models_from_live_provider_ids(provider_id: str, live_ids: list[str]) -> list[dict]:
     """Convert Hermes CLI model ids into WebUI picker model entries."""
     formatter = _format_ollama_label if provider_id in ("ollama", "ollama-cloud") else None
+    curated_labels = {
+        str(model.get("id", "") or "").strip(): model.get("label")
+        for model in _PROVIDER_MODELS.get(provider_id, [])
+        if isinstance(model, dict) and model.get("id") and model.get("label")
+    }
     models: list[dict] = []
     seen: set[str] = set()
     for mid in live_ids:
@@ -3745,7 +3754,11 @@ def _models_from_live_provider_ids(provider_id: str, live_ids: list[str]) -> lis
         if not mid_s or mid_s in seen:
             continue
         seen.add(mid_s)
-        label = formatter(mid_s) if formatter else _get_label_for_model(mid_s, [])
+        label = (
+            formatter(mid_s)
+            if formatter
+            else curated_labels.get(mid_s) or _get_label_for_model(mid_s, [])
+        )
         models.append({"id": mid_s, "label": label})
     return models
 
@@ -4996,13 +5009,6 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
                     if not raw_models:
                         live_ids = _read_live_provider_model_ids(pid)
                         raw_models = _models_from_live_provider_ids(pid, live_ids)
-
-                    if pid == "zai" and live_ids:
-                        live_model_ids = {model["id"] for model in raw_models}
-                        raw_models.extend(
-                            model for model in _PROVIDER_MODELS[pid]
-                            if model["id"] not in live_model_ids
-                        )
 
                     if not raw_models:
                         raw_models = copy.deepcopy(_PROVIDER_MODELS.get(pid, []))
