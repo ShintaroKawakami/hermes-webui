@@ -20,6 +20,12 @@ MESSAGING_SOURCES = {
 CLI_MIN_UNTITLED_MESSAGE_COUNT = 6
 CLI_MIN_UNTITLED_USER_MESSAGE_COUNT = 2
 
+# Session-list reads are additive metadata for WebUI.  They must never wait on
+# the Hermes Agent writer long enough to make the mobile client fall back to
+# its offline cache.  A failed read is safe here: the WebUI rows still render,
+# and the next cache refresh will retry the additive projection.
+AGENT_STATE_DB_READ_TIMEOUT_SECONDS = 0.25
+
 SOURCE_LABELS = {
     'api_server': 'API',
     'cli': 'CLI',
@@ -433,7 +439,13 @@ def read_importable_agent_session_rows(
     # rejected because DDL/commit can contend with the agent's writer; index
     # maintenance belongs outside this read-only listing path.
     db_uri = db_path.resolve().as_uri() + "?mode=ro"
-    with closing(sqlite3.connect(db_uri, uri=True)) as conn:
+    with closing(
+        sqlite3.connect(
+            db_uri,
+            uri=True,
+            timeout=AGENT_STATE_DB_READ_TIMEOUT_SECONDS,
+        )
+    ) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
@@ -953,7 +965,12 @@ def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[st
         return {}
 
     try:
-        with closing(sqlite3.connect(str(db_path))) as conn:
+        with closing(
+            sqlite3.connect(
+                str(db_path),
+                timeout=AGENT_STATE_DB_READ_TIMEOUT_SECONDS,
+            )
+        ) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(sessions)")

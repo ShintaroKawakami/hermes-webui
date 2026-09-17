@@ -72,7 +72,16 @@ def test_listing_reads_indexed_and_unindexed_databases_without_writes(
     )
 
     assert [row["id"] for row in rows] == ["cli-1"]
-    assert calls == [(db.resolve().as_uri() + "?mode=ro", (), {"uri": True})]
+    assert calls == [
+        (
+            db.resolve().as_uri() + "?mode=ro",
+            (),
+            {
+                "uri": True,
+                "timeout": agent_sessions.AGENT_STATE_DB_READ_TIMEOUT_SECONDS,
+            },
+        )
+    ]
     read_only_conn = real_connect(db.resolve().as_uri() + "?mode=ro", uri=True)
     try:
         with pytest.raises(sqlite3.OperationalError):

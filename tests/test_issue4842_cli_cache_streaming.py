@@ -124,6 +124,31 @@ def test_get_cli_sessions_follower_reuses_stale_rows_during_slow_rebuild(monkeyp
     assert results["owner"] == [{"session_id": "fresh", "title": "fresh-row"}]
 
 
+def test_get_cli_sessions_owner_returns_stale_rows_when_refresh_fails(monkeypatch, tmp_path):
+    """A transient state.db lock must not erase the last sidebar snapshot."""
+    _hermes_home, _db_path, cache_key = _cache_context(monkeypatch, tmp_path)
+    models.clear_cli_sessions_cache()
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 60.0)
+    cache_stamp = models._cli_sessions_cache_invalidation_stamp()
+    with models._CLI_SESSIONS_CACHE_LOCK:
+        models._CLI_SESSIONS_CACHE[cache_key] = (
+            time.monotonic() - 1.0,
+            cache_stamp,
+            [{"session_id": "stale", "title": "stale-row"}],
+        )
+
+    def failing_loader(*_args, **_kwargs):
+        raise TimeoutError("state.db is busy")
+
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", failing_loader)
+    try:
+        assert models.get_cli_sessions() == [
+            {"session_id": "stale", "title": "stale-row"}
+        ]
+    finally:
+        models.clear_cli_sessions_cache()
+
+
 def test_get_cli_sessions_caches_a_deep_copied_uncached_result(monkeypatch, tmp_path):
     """Cache hits keep the established deep-copy isolation and read behavior."""
     _cache_context(monkeypatch, tmp_path)

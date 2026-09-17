@@ -22,6 +22,7 @@ from api.config import (
 from api.workspace import get_last_workspace
 from api.usage import prompt_cache_hit_percent
 from api.agent_sessions import (
+    AGENT_STATE_DB_READ_TIMEOUT_SECONDS,
     _is_continuation_session,
     is_cli_session_row,
     read_importable_agent_session_rows,
@@ -3028,7 +3029,12 @@ def agent_session_rows_existing(
     if db_path is None:
         return frozenset(wanted)
     try:
-        with closing(sqlite3.connect(str(db_path))) as conn:
+        with closing(
+            sqlite3.connect(
+                str(db_path),
+                timeout=AGENT_STATE_DB_READ_TIMEOUT_SECONDS,
+            )
+        ) as conn:
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(sessions)")
             cols = {str(row[1]) for row in cur.fetchall()}
@@ -4030,6 +4036,11 @@ def get_cli_sessions() -> list:
                         "get_cli_sessions() failed — check state.db schema or path (%s): %s",
                         db_path, _cli_err,
                     )
+                    if (
+                        stale_sessions is not None
+                        and stale_stamp == _cli_sessions_cache_invalidation_stamp()
+                    ):
+                        return stale_sessions
                     return []
                 with _CLI_SESSIONS_CACHE_LOCK:
                     # Recheck while holding the write lock so a clear that
