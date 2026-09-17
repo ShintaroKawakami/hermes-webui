@@ -199,9 +199,11 @@ def _read_active_profile_file() -> str:
 _root_profile_name_cache: set[str] = {'default'}
 _root_profile_name_cache_lock = threading.Lock()
 _root_profile_name_cache_loaded = False
-# The sidebar only needs the root-profile identity while matching rows. Keep
-# that lookup separate from the full profile-list response, whose skill counts
-# can require reading every profile's SKILL.md file.
+# [fix] 2026-09-18: sidebar profile matching needs only the root identity, but
+# list_profiles_api() also computes every profile's skill counts. Keep the
+# thread-local lookup separate so /api/sessions stays responsive while the
+# normal profile-list metadata remains complete. Simplifying the public list
+# response was rejected because it would remove data used by the profile UI.
 _root_profile_lookup = threading.local()
 
 
