@@ -4040,7 +4040,7 @@ def get_cli_sessions() -> list:
                         stale_sessions is not None
                         and stale_stamp == _cli_sessions_cache_invalidation_stamp()
                     ):
-                        return stale_sessions
+                        return _copy_cli_sessions(stale_sessions)
                     return []
                 with _CLI_SESSIONS_CACHE_LOCK:
                     # Recheck while holding the write lock so a clear that

@@ -108,3 +108,29 @@ def test_listing_encodes_url_significant_database_path(tmp_path, monkeypatch):
         db, exclude_sources=None
     )[0]["id"] == "cli-1"
     assert calls == [db.resolve().as_uri() + "?mode=ro"]
+
+
+def test_sidebar_metadata_and_orphan_probe_use_bounded_timeout(tmp_path, monkeypatch):
+    """All other /api/sessions SQLite readers must share the same bound."""
+    db = tmp_path / "state.db"
+    _make_db(db, indexed=False)
+    calls = []
+    real_connect = sqlite3.connect
+
+    def connect(database, *args, **kwargs):
+        calls.append((database, args, kwargs))
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(agent_sessions.sqlite3, "connect", connect)
+    agent_sessions.read_session_lineage_metadata(db, ["cli-1"])
+
+    import api.models as models
+
+    monkeypatch.setattr(models, "_agent_state_db_path", lambda **_kwargs: db)
+    assert models.agent_session_rows_existing(["cli-1"]) == frozenset({"cli-1"})
+
+    assert len(calls) == 2
+    assert all(
+        call[2]["timeout"] == agent_sessions.AGENT_STATE_DB_READ_TIMEOUT_SECONDS
+        for call in calls
+    )

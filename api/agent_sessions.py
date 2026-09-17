@@ -20,10 +20,12 @@ MESSAGING_SOURCES = {
 CLI_MIN_UNTITLED_MESSAGE_COUNT = 6
 CLI_MIN_UNTITLED_USER_MESSAGE_COUNT = 2
 
-# Session-list reads are additive metadata for WebUI.  They must never wait on
-# the Hermes Agent writer long enough to make the mobile client fall back to
-# its offline cache.  A failed read is safe here: the WebUI rows still render,
-# and the next cache refresh will retry the additive projection.
+# [fix] 2026-09-18: bound agent-state reads for the mobile session-list path.
+# The default SQLite busy timeout lets the agent writer hold /api/sessions for
+# seconds, which makes Hermex fall back to its offline cache.  Increasing the
+# wait or adding retry/DDL would extend the request and contend with that same
+# writer; these rows are additive, so skipping them for one poll and refreshing
+# on the next poll preserves the native WebUI sessions safely.
 AGENT_STATE_DB_READ_TIMEOUT_SECONDS = 0.25
 
 SOURCE_LABELS = {
