@@ -6,6 +6,35 @@ import time
 import api.models as models
 
 
+class _DelayedAcquireLock:
+    """Gate one lock acquisition so an invalidation can win the race."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._skip = 0
+        self._delay = False
+        self.before_delayed_acquire = threading.Event()
+        self.allow_delayed_acquire = threading.Event()
+
+    def arm_after(self, acquisitions):
+        self._skip = acquisitions
+        self._delay = True
+
+    def __enter__(self):
+        if self._delay:
+            if self._skip:
+                self._skip -= 1
+            else:
+                self._delay = False
+                self.before_delayed_acquire.set()
+                assert self.allow_delayed_acquire.wait(1.0)
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._lock.release()
+
+
 def _cache_context(monkeypatch, tmp_path):
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir()
@@ -169,3 +198,41 @@ def test_cold_follower_does_not_start_a_second_rebuild(monkeypatch, tmp_path):
         models.clear_cli_sessions_cache()
 
     assert results["owner"] == [{"session_id": "fresh"}]
+
+
+def test_clear_between_invalidation_check_and_store_wins(monkeypatch, tmp_path):
+    """A clear in the final write window must prevent stale cache repopulation."""
+    _hermes_home, _db_path, cache_key = _cache_context(monkeypatch, tmp_path)
+    gate = _DelayedAcquireLock()
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_LOCK", gate)
+    models.clear_cli_sessions_cache()
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 60.0)
+    started = threading.Event()
+    release = threading.Event()
+    results = {}
+
+    def blocking_loader(*_args, **_kwargs):
+        started.set()
+        release.wait()
+        return [{"session_id": "invalidated"}]
+
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", blocking_loader)
+    owner = threading.Thread(
+        target=lambda: results.setdefault("owner", models.get_cli_sessions()),
+        daemon=True,
+    )
+    owner.start()
+    assert started.wait(1.0), "owner did not start"
+    # The first lock acquisition after the loader is the stamp read; delay
+    # the following cache-write acquisition to open the exact race window.
+    gate.arm_after(1)
+    release.set()
+    assert gate.before_delayed_acquire.wait(1.0), "cache write was not gated"
+    models.clear_cli_sessions_cache()
+    gate.allow_delayed_acquire.set()
+    owner.join(1.0)
+
+    assert not owner.is_alive()
+    assert results["owner"] == [{"session_id": "invalidated"}]
+    with gate:
+        assert cache_key not in models._CLI_SESSIONS_CACHE

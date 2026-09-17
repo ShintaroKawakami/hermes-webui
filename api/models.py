@@ -36,6 +36,13 @@ CLI_VISIBLE_SESSION_LIMIT = 20
 # sidebar window (#3172).
 CRON_PROJECT_CHIP_LIMIT = 200
 _CLI_SESSIONS_CACHE_TTL_SECONDS = 5.0
+# [fix] 2026-09-18: keep CLI sidebar requests responsive while state.db is
+# being projected. The request is to stop a slow rebuild from serializing
+# iPhone/WebUI followers, while preserving the read-only SQLite contract.
+# We considered increasing the lock timeout or moving the whole cache to a
+# second store, but both would keep the long read or add a new persistence
+# dependency; single-flight ownership with a stale snapshot is the smallest
+# change that matches the existing cache and failure boundaries.
 _CLI_SESSIONS_CACHE_LOCK = threading.Lock()
 _CLI_SESSIONS_CACHE_INFLIGHT: "dict[tuple, threading.Event]" = {}
 _CLI_SESSIONS_CACHE_INVALIDATION_VERSION = 0
@@ -4032,8 +4039,11 @@ def get_cli_sessions() -> list:
                         db_path, _cli_err,
                     )
                     return []
-                if _cli_sessions_cache_invalidation_stamp() == invalidation_stamp:
-                    with _CLI_SESSIONS_CACHE_LOCK:
+                with _CLI_SESSIONS_CACHE_LOCK:
+                    # Recheck while holding the write lock so a clear that
+                    # lands between the precheck and this block cannot let an
+                    # invalidated projection back into the cache.
+                    if _CLI_SESSIONS_CACHE_INVALIDATION_VERSION == invalidation_stamp:
                         _CLI_SESSIONS_CACHE[cache_key] = (
                             time.monotonic() + ttl,
                             _CLI_SESSIONS_CACHE_INVALIDATION_VERSION,
