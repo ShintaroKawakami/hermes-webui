@@ -285,6 +285,22 @@ def test_modern_candidate_projection_can_include_one_source_before_limit(tmp_pat
             "INSERT INTO messages(session_id, role, content, timestamp) VALUES (?, 'user', 'cron', ?)",
             (sid, started),
         )
+    for i in range(20):
+        sid = f"modern_webui_newer_{i:02d}"
+        started = base + 100 + i
+        conn.execute(
+            """
+            INSERT INTO sessions
+            (id, source, session_source, title, model, started_at,
+             last_activity_at, message_count, parent_session_id, ended_at, end_reason)
+            VALUES (?, 'webui', 'webui', ?, 'openai/gpt-5', ?, ?, 1, NULL, NULL, NULL)
+            """,
+            (sid, sid, started, started),
+        )
+        conn.execute(
+            "INSERT INTO messages(session_id, role, content, timestamp) VALUES (?, 'user', 'webui', ?)",
+            (sid, started),
+        )
     conn.commit()
     conn.close()
 
@@ -297,6 +313,15 @@ def test_modern_candidate_projection_can_include_one_source_before_limit(tmp_pat
 
     assert rows[0]["id"] == "modern_cron_19"
     assert {row["source"] for row in rows} == {"cron"}
+
+
+def test_importable_agent_rows_empty_source_scope_returns_empty(tmp_path):
+    db = tmp_path / "state.db"
+    _make_state_db(db, sessions=5, messages_per_session=1)
+
+    assert agent_sessions.read_importable_agent_session_rows(
+        db, include_sources=()
+    ) == []
 
 
 def test_modern_empty_candidates_filter_excluded_sources_before_limit(monkeypatch, tmp_path):

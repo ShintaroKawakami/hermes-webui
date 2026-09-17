@@ -421,6 +421,12 @@ def read_importable_agent_session_rows(
     if not db_path.exists():
         return []
 
+    included_sources = None
+    if include_sources is not None:
+        included_sources = tuple(str(source) for source in include_sources if source)
+        if not included_sources:
+            return []
+
     log = log or logger
     # [fix] CaD 2026-09-17: /api/sessions must not block on SQLite writes while
     # the health endpoint remains responsive. Hot-path index self-heal is
@@ -542,12 +548,10 @@ def read_importable_agent_session_rows(
                 placeholders = ", ".join("?" for _ in excluded)
                 where_clauses.append(f"s.source NOT IN ({placeholders})")
                 params.extend(excluded)
-        if include_sources:
-            included = tuple(str(source) for source in include_sources if source)
-            if included:
-                placeholders = ", ".join("?" for _ in included)
-                where_clauses.append(f"s.source IN ({placeholders})")
-                params.extend(included)
+        if included_sources is not None:
+            placeholders = ", ".join("?" for _ in included_sources)
+            where_clauses.append(f"s.source IN ({placeholders})")
+            params.extend(included_sources)
 
         select_sql = f"""
             SELECT s.id, s.title, s.model, s.message_count,
@@ -580,12 +584,13 @@ def read_importable_agent_session_rows(
             # can be resumed days later and should still surface at the top.
             # Oversampling preserves room for hidden compression segments or
             # other rows filtered after projection.
-            # [perf] 2026-09-18: The cron project-chip pass must not read
-            # unrelated wide session payloads merely to discard them later.
-            # Keep the normal sidebar's compression headroom, but use a
-            # smaller source-scoped margin after the source index has filtered
-            # the candidate set. Retaining the factor of eight for both paths
-            # would preserve the cold-start timeout this repair is addressing.
+            # [perf] 2026-09-18: The cron project-chip pass must keep the
+            # iPhone sidebar responsive by applying its source condition before
+            # the candidate LIMIT, so unrelated wide payloads are never read.
+            # The normal sidebar keeps compression headroom; the source-scoped
+            # pass uses a factor of two. Keeping factor eight for both paths or
+            # filtering after LIMIT would retain the cold-start timeout, so
+            # those alternatives are rejected.
             candidate_multiplier = 2 if include_sources else 8
             candidate_limit = max(result_limit * candidate_multiplier, result_limit)
             if fast_message_candidates:
