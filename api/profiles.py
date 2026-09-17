@@ -1081,77 +1081,82 @@ def switch_profile(name: str, *, process_wide: bool = True) -> dict:
 
 _SKILLS_STATS_CACHE: dict[Path, tuple[int, int, float]] = {}
 _SKILLS_STATS_CACHE_TTL = 8.0  # seconds
+# [fix] CaD 2026-09-17: per-profile/list locks serialize scans and cold builds;
+# one global lock is rejected because unrelated profiles should proceed freely.
+_SKILLS_STATS_LOCKS: dict[Path, threading.Lock] = {}
+_SKILLS_STATS_LOCKS_GUARD = threading.Lock()
 
 
 def _get_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
     """Calculate (enabled_count, compatible_count) for a profile directory."""
     import time
     profile_dir = Path(profile_dir).resolve()
-    now = time.time()
-    # Read via .get() (not membership-check + index) so a concurrent
-    # _SKILLS_STATS_CACHE.clear() on another thread can't raise KeyError
-    # between the `in` test and the lookup.
-    cached = _SKILLS_STATS_CACHE.get(profile_dir)
-    if cached is not None:
-        enabled, compat, expiry = cached
-        if now < expiry:
-            return enabled, compat
+    with _SKILLS_STATS_LOCKS_GUARD:
+        profile_lock = _SKILLS_STATS_LOCKS.setdefault(profile_dir, threading.Lock())
+    with profile_lock:
+        now = time.time()
+        # Recheck under the per-profile lock so concurrent callers share one scan.
+        cached = _SKILLS_STATS_CACHE.get(profile_dir)
+        if cached is not None:
+            enabled, compat, expiry = cached
+            if now < expiry:
+                return enabled, compat
 
-    skills_dir = profile_dir / "skills"
-    if not skills_dir.is_dir():
-        res = (0, 0)
+        skills_dir = profile_dir / "skills"
+        if not skills_dir.is_dir():
+            res = (0, 0)
+            _SKILLS_STATS_CACHE[profile_dir] = (res[0], res[1], now + _SKILLS_STATS_CACHE_TTL)
+            return res
+
+        disabled = set()
+        config_path = profile_dir / "config.yaml"
+        if config_path.exists():
+            try:
+                import yaml as _yaml
+                cfg = _yaml.safe_load(config_path.read_text(encoding="utf-8"))
+                if isinstance(cfg, dict):
+                    skills_cfg = cfg.get("skills")
+                    if isinstance(skills_cfg, dict):
+                        # Align with get_disabled_skill_names(platform="webui") behavior:
+                        platform_disabled = (skills_cfg.get("platform_disabled") or {}).get("webui")
+                        if platform_disabled is not None:
+                            disabled_val = platform_disabled
+                        else:
+                            disabled_val = skills_cfg.get("disabled")
+
+                        if disabled_val is not None:
+                            if isinstance(disabled_val, str):
+                                disabled_val = [disabled_val]
+                            disabled = {str(v).strip() for v in disabled_val if str(v).strip()}
+            except Exception:
+                pass
+
+        from agent.skill_utils import iter_skill_index_files, parse_frontmatter, skill_matches_platform
+
+        seen_names = set()
+        enabled_count = 0
+        compatible_count = 0
+
+        for skill_md in iter_skill_index_files(skills_dir, "SKILL.md"):
+            try:
+                content = skill_md.read_text(encoding="utf-8")[:4000]
+                frontmatter, _ = parse_frontmatter(content)
+                if not skill_matches_platform(frontmatter):
+                    continue
+                name = frontmatter.get("name", skill_md.parent.name)[:64]
+                if name in seen_names:
+                    continue
+                seen_names.add(name)
+
+                compatible_count += 1
+                if name not in disabled:
+                    enabled_count += 1
+            except Exception:
+                pass
+
+        res = (enabled_count, compatible_count)
         _SKILLS_STATS_CACHE[profile_dir] = (res[0], res[1], now + _SKILLS_STATS_CACHE_TTL)
         return res
-
-    disabled = set()
-    config_path = profile_dir / "config.yaml"
-    if config_path.exists():
-        try:
-            import yaml as _yaml
-            cfg = _yaml.safe_load(config_path.read_text(encoding="utf-8"))
-            if isinstance(cfg, dict):
-                skills_cfg = cfg.get("skills")
-                if isinstance(skills_cfg, dict):
-                    # Align with get_disabled_skill_names(platform="webui") behavior:
-                    platform_disabled = (skills_cfg.get("platform_disabled") or {}).get("webui")
-                    if platform_disabled is not None:
-                        disabled_val = platform_disabled
-                    else:
-                        disabled_val = skills_cfg.get("disabled")
-                    
-                    if disabled_val is not None:
-                        if isinstance(disabled_val, str):
-                            disabled_val = [disabled_val]
-                        disabled = {str(v).strip() for v in disabled_val if str(v).strip()}
-        except Exception:
-            pass
-
-    from agent.skill_utils import iter_skill_index_files, parse_frontmatter, skill_matches_platform
-    
-    seen_names = set()
-    enabled_count = 0
-    compatible_count = 0
-    
-    for skill_md in iter_skill_index_files(skills_dir, "SKILL.md"):
-        try:
-            content = skill_md.read_text(encoding="utf-8")[:4000]
-            frontmatter, _ = parse_frontmatter(content)
-            if not skill_matches_platform(frontmatter):
-                continue
-            name = frontmatter.get("name", skill_md.parent.name)[:64]
-            if name in seen_names:
-                continue
-            seen_names.add(name)
-            
-            compatible_count += 1
-            if name not in disabled:
-                enabled_count += 1
-        except Exception:
-            pass
-            
-    res = (enabled_count, compatible_count)
-    _SKILLS_STATS_CACHE[profile_dir] = (res[0], res[1], now + _SKILLS_STATS_CACHE_TTL)
-    return res
 
 
 _LIST_PROFILES_CACHE: tuple[list, float] | None = None
@@ -1255,54 +1260,52 @@ def list_profiles_api() -> list:
     """
     import time
     global _LIST_PROFILES_CACHE
-    now = time.time()
-
     with _LIST_PROFILES_CACHE_LOCK:
+        now = time.time()
         cached = _LIST_PROFILES_CACHE
-    if cached is not None and now - cached[1] < _LIST_PROFILES_CACHE_TTL:
+        if cached is not None and now - cached[1] < _LIST_PROFILES_CACHE_TTL:
+            active = get_active_profile_name()
+            # Return a fresh copy with is_active recomputed (cheap, per-request).
+            return [{**p, 'is_active': p['name'] == active} for p in cached[0]]
+
+        rows = _build_profile_rows_fast()
+        if rows is None:
+            # Fallback: cheap helpers unavailable — use the original (slow) path,
+            # or the default-only dict if hermes_cli isn't importable at all.
+            logger.debug(
+                "list_profiles_api: fast path unavailable, falling back to "
+                "upstream list_profiles() (slower)"
+            )
+            try:
+                from hermes_cli.profiles import list_profiles
+                infos = list_profiles()
+            except ImportError:
+                return [_default_profile_dict()]
+
+            active = get_active_profile_name()
+            result = []
+            for p in infos:
+                enabled_count, total_count = _get_profile_skills_stats(p.path)
+                result.append({
+                    'name': p.name,
+                    'path': str(p.path),
+                    'is_default': p.is_default,
+                    'is_active': p.name == active,
+                    'gateway_running': p.gateway_running,
+                    'model': p.model,
+                    'provider': p.provider,
+                    'has_env': p.has_env,
+                    'visible': _profile_visible_from_meta(p.path),
+                    'skill_count': enabled_count,
+                    'enabled_skills': enabled_count,
+                    'total_skills': total_count,
+                })
+            return result
+
+        # Stamp freshness only after the cold build completed successfully.
+        _LIST_PROFILES_CACHE = (rows, time.time())
         active = get_active_profile_name()
-        # Return a fresh copy with is_active recomputed (cheap, per-request).
-        return [{**p, 'is_active': p['name'] == active} for p in cached[0]]
-
-    rows = _build_profile_rows_fast()
-    if rows is None:
-        # Fallback: cheap helpers unavailable — use the original (slow) path,
-        # or the default-only dict if hermes_cli isn't importable at all.
-        logger.debug(
-            "list_profiles_api: fast path unavailable, falling back to "
-            "upstream list_profiles() (slower)"
-        )
-        try:
-            from hermes_cli.profiles import list_profiles
-            infos = list_profiles()
-        except ImportError:
-            return [_default_profile_dict()]
-
-        active = get_active_profile_name()
-        result = []
-        for p in infos:
-            enabled_count, total_count = _get_profile_skills_stats(p.path)
-            result.append({
-                'name': p.name,
-                'path': str(p.path),
-                'is_default': p.is_default,
-                'is_active': p.name == active,
-                'gateway_running': p.gateway_running,
-                'model': p.model,
-                'provider': p.provider,
-                'has_env': p.has_env,
-                'visible': _profile_visible_from_meta(p.path),
-                'skill_count': enabled_count,
-                'enabled_skills': enabled_count,
-                'total_skills': total_count,
-            })
-        return result
-
-    with _LIST_PROFILES_CACHE_LOCK:
-        _LIST_PROFILES_CACHE = (rows, now)
-
-    active = get_active_profile_name()
-    return [{**p, 'is_active': p['name'] == active} for p in rows]
+        return [{**p, 'is_active': p['name'] == active} for p in rows]
 
 
 def _profile_visible_from_meta(profile_path: Path) -> bool:
