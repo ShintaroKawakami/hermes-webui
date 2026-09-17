@@ -186,6 +186,11 @@ class GatewayWatcher:
     """
 
     POLL_INTERVAL = 5  # seconds between polls
+    # [2026-09-17][fix] The iPhone cached/offline incident showed that a
+    # role-inclusive five-second scan can block the sessions request on a large
+    # messages table. Keep role out of the hot query and use the bounded parity
+    # projection below; restoring ``LOWER(m.role)`` to the five-second path is
+    # intentionally rejected to preserve request latency.
     # ``messages.role`` is not present in the agent's covering
     # ``(session_id, timestamp)`` index, but the full projection uses it for CLI
     # visibility. Keep the hot poll index-only and bound detection of rare
