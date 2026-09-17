@@ -185,11 +185,42 @@ def test_modern_candidate_projection_keeps_resumed_old_session(tmp_path):
     """The indexed modern path must retain exact latest-message ordering."""
     db = tmp_path / "state.db"
     _make_modern_state_db(db)
+    conn = sqlite3.connect(str(db))
+    root_started = time.time() - 900
+    conn.execute(
+        """
+        INSERT INTO sessions
+        (id, source, session_source, title, model, started_at,
+         last_activity_at, message_count, parent_session_id, ended_at, end_reason)
+        VALUES ('modern_chain_root', 'cli', 'cli', 'Modern chain',
+                'openai/gpt-5', ?, ?, 0, NULL, ?, 'compression')
+        """,
+        (root_started, root_started, root_started + 10),
+    )
+    conn.execute(
+        """
+        INSERT INTO sessions
+        (id, source, session_source, title, model, started_at,
+         last_activity_at, message_count, parent_session_id, ended_at, end_reason)
+        VALUES ('modern_chain_empty', 'cli', 'cli', 'Modern chain #2',
+                'openai/gpt-5', ?, ?, 1, 'modern_chain_root', ?, NULL)
+        """,
+        (root_started + 11, root_started + 11, root_started + 20),
+    )
+    conn.execute(
+        "INSERT INTO messages(session_id, role, content, timestamp) VALUES ('modern_chain_empty', 'user', 'chain', ?)",
+        (root_started + 12,),
+    )
+    conn.commit()
+    conn.close()
 
-    rows = agent_sessions.read_importable_agent_session_rows(db, limit=20, exclude_sources=("webui",))
+    rows = agent_sessions.read_importable_agent_session_rows(db, limit=200, exclude_sources=("webui",))
 
     assert rows[0]["id"] == "modern_resumed_old"
     assert rows[0]["actual_message_count"] == 2
+    chain = next(row for row in rows if row["id"] == "modern_chain_empty")
+    assert chain["_lineage_root_id"] == "modern_chain_root"
+    assert chain["_compression_segment_count"] == 2
     src = (REPO_ROOT / "api" / "agent_sessions.py").read_text()
     assert "WITH latest_messages AS" in src
     assert "FROM latest_messages lm" in src

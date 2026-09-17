@@ -485,13 +485,18 @@ def read_importable_agent_session_rows(
             join_clause = ""
             group_by_clause = ""
 
-        # Modern Hermes Agent databases carry ``sessions.last_activity_at``.
+        # [fix] 2026-09-18: modern Hermes Agent databases carry
+        # ``sessions.last_activity_at``. The sidebar must remain responsive on
+        # a cold Mac mini state.db while preserving empty compression segments.
         # Use a grouped, index-backed messages projection as the candidate
         # source in that schema instead of scanning every wide ``sessions`` row
         # and running a correlated subquery for each one. Session rows can carry
         # large system-prompt/origin payloads, so that table scan makes the
-        # first sidebar request read the whole state.db from cold storage.
-        # Legacy schemas keep the correlated query for compatibility.
+        # first sidebar request read the whole state.db from cold storage. A
+        # separate indexed empty-row candidate set keeps compression lineage
+        # intact. The rejected alternative is a modern-schema LEFT JOIN from
+        # ``sessions``: it still scans the wide table before sorting. Legacy
+        # schemas keep the correlated query for compatibility.
         fast_message_candidates = (
             use_messages_join
             and messages_has_timestamp
@@ -563,15 +568,30 @@ def read_importable_agent_session_rows(
                     SELECT mx.session_id, MAX(mx.timestamp) AS last_message_at
                     FROM messages mx
                     GROUP BY mx.session_id
-                ), candidates AS (
-                    SELECT lm.session_id AS id
+                ), message_candidates AS (
+                    SELECT lm.session_id AS id, lm.last_message_at, s.started_at
                     FROM latest_messages lm
                     JOIN sessions s ON s.id = lm.session_id
                     WHERE {' AND '.join(where_clauses)}
-                    {candidate_order_clause}
+                    ORDER BY lm.last_message_at DESC, s.started_at DESC
                     LIMIT ?
+                ), empty_candidates AS (
+                    SELECT s.id, NULL AS last_message_at, s.started_at
+                    FROM sessions s
+                    LEFT JOIN latest_messages lm ON lm.session_id = s.id
+                    WHERE {' AND '.join(where_clauses)}
+                      AND COALESCE(s.message_count, 0) <= 0
+                      AND lm.session_id IS NULL
+                    ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC,
+                             s.started_at DESC
+                    LIMIT ?
+                ), candidates AS (
+                    SELECT id, last_message_at, started_at FROM message_candidates
+                    UNION ALL
+                    SELECT id, last_message_at, started_at FROM empty_candidates
                 )
                 """
+                candidate_params = [*params, candidate_limit, *params, candidate_limit]
             else:
                 candidate_cte = f"""
                 WITH candidates AS (
@@ -582,6 +602,7 @@ def read_importable_agent_session_rows(
                     LIMIT ?
                 )
                 """
+                candidate_params = [*params, candidate_limit]
             cur.execute(
                 f"""
                 {candidate_cte}
@@ -592,7 +613,7 @@ def read_importable_agent_session_rows(
                 {group_by_clause}
                 {order_by_clause}
                 """,
-                [*params, candidate_limit],
+                candidate_params,
             )
         else:
             cur.execute(
