@@ -253,6 +253,35 @@ def test_modern_candidate_projection_falls_back_to_started_at_for_null_timestamp
     assert rows[0]["id"] == "modern_null_timestamp"
 
 
+def test_modern_empty_candidate_projection_orders_by_started_at(monkeypatch, tmp_path):
+    """Empty rows use the same started_at order as the final projection."""
+    db = tmp_path / "state.db"
+    _make_modern_state_db(db)
+    conn = sqlite3.connect(str(db))
+    conn.execute("UPDATE sessions SET source = 'webui'")
+    base = time.time()
+    for i in range(10):
+        conn.execute(
+            """
+            INSERT INTO sessions
+            (id, source, session_source, title, model, started_at,
+             last_activity_at, message_count, parent_session_id, ended_at, end_reason)
+            VALUES (?, 'cli', 'cli', ?, 'openai/gpt-5', ?, ?, 0, NULL, NULL, NULL)
+            """,
+            (f"modern_empty_{i:02d}", f"Empty {i}", base + i, base - i),
+        )
+    conn.commit()
+    conn.close()
+
+    # Keep the raw candidate rows visible so this test isolates SQL ordering;
+    # normal projection intentionally hides empty standalone sessions.
+    monkeypatch.setattr(agent_sessions, "_project_agent_session_rows", lambda rows: rows)
+    monkeypatch.setattr(agent_sessions, "is_cli_session_row_visible", lambda row: True)
+    rows = agent_sessions.read_importable_agent_session_rows(db, limit=1, exclude_sources=("webui",))
+
+    assert rows[0]["id"] == "modern_empty_09"
+
+
 def test_importable_agent_rows_zero_limit_skips_query_work(tmp_path):
     db = tmp_path / "state.db"
     _make_state_db(db, sessions=5, messages_per_session=1)

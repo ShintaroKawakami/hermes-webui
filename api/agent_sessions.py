@@ -507,6 +507,7 @@ def read_importable_agent_session_rows(
             and 'last_activity_at' in session_cols
             and 'idx_messages_session' in message_indexes
             and 'idx_sessions_effective_activity' in session_indexes
+            and 'idx_sessions_started' in session_indexes
         )
         if use_messages_join and messages_has_timestamp:
             order_by_clause = "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC"
@@ -590,8 +591,7 @@ def read_importable_agent_session_rows(
                       AND NOT EXISTS (
                           SELECT 1 FROM messages m0 WHERE m0.session_id = s.id
                       )
-                    ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC,
-                             s.started_at DESC
+                    ORDER BY s.started_at DESC
                     LIMIT ?
                 ), candidates AS (
                     SELECT id, last_message_at, started_at FROM message_candidates
