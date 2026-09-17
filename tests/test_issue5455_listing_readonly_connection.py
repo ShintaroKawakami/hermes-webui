@@ -38,6 +38,14 @@ class _NoCommitConnection:
     def __init__(self, connection):
         self._connection = connection
 
+    @property
+    def row_factory(self):
+        return self._connection.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value):
+        self._connection.row_factory = value
+
     def __getattr__(self, name):
         if name == "commit":
             raise AssertionError("session listing must not commit")
