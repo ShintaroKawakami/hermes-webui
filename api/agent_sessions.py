@@ -622,6 +622,7 @@ def read_importable_agent_session_rows(
                 ), empty_candidate_rows AS (
                     SELECT s.rowid AS session_rowid
                     FROM sessions s INDEXED BY idx_sessions_started
+                    WHERE {' AND '.join(where_clauses)}
                     ORDER BY s.started_at DESC
                     LIMIT ?
                 ), empty_candidates AS (
@@ -659,6 +660,7 @@ def read_importable_agent_session_rows(
                     candidate_limit,
                     *params,
                     candidate_limit,
+                    *params,
                     empty_scan_limit,
                     *params,
                     candidate_limit,

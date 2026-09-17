@@ -261,6 +261,47 @@ def test_modern_candidate_projection_filters_excluded_sources_before_limit(tmp_p
     assert rows[0]["id"] == "modern_resumed_old"
 
 
+def test_modern_empty_candidates_filter_excluded_sources_before_limit(monkeypatch, tmp_path):
+    """Excluded empty rows must not consume the bounded empty candidate window."""
+    db = tmp_path / "state.db"
+    _make_modern_state_db(db)
+    conn = sqlite3.connect(str(db))
+    base = time.time() + 1000
+    for i in range(70):
+        sid = f"modern_empty_webui_{i:02d}"
+        started = base + i
+        conn.execute(
+            """
+            INSERT INTO sessions
+            (id, source, session_source, title, model, started_at,
+             last_activity_at, message_count, parent_session_id, ended_at, end_reason)
+            VALUES (?, 'webui', 'webui', ?, 'openai/gpt-5', ?, ?, 0, NULL, NULL, NULL)
+            """,
+            (sid, sid, started, started),
+        )
+    conn.execute(
+        """
+        INSERT INTO sessions
+        (id, source, session_source, title, model, started_at,
+         last_activity_at, message_count, parent_session_id, ended_at, end_reason)
+        VALUES ('modern_empty_cli_after_hidden', 'cli', 'cli',
+                'Recovered empty session', 'openai/gpt-5', ?, ?, 0,
+                NULL, NULL, NULL)
+        """,
+        (base - 1, base - 1),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(agent_sessions, "_project_agent_session_rows", lambda rows: rows)
+    monkeypatch.setattr(agent_sessions, "is_cli_session_row_visible", lambda row: True)
+    rows = agent_sessions.read_importable_agent_session_rows(
+        db, limit=1, exclude_sources=("webui",)
+    )
+
+    assert rows[0]["id"] == "modern_empty_cli_after_hidden"
+
+
 def test_modern_candidate_projection_keeps_message_count_mismatch_candidate(monkeypatch, tmp_path):
     """A stale positive count must not hide a session with no message rows."""
     db = tmp_path / "state.db"
@@ -379,7 +420,7 @@ def test_modern_candidate_projection_full_query_has_no_wide_session_scan(monkeyp
     details = [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)]
     conn.close()
 
-    assert any("SCAN s USING COVERING INDEX idx_sessions_started" in detail for detail in details)
+    assert any("SCAN s USING INDEX idx_sessions_started" in detail for detail in details)
     assert any("SEARCH s USING INTEGER PRIMARY KEY" in detail for detail in details)
     assert not any(detail == "SCAN s" for detail in details)
 
