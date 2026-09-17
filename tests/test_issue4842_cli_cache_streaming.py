@@ -4,6 +4,7 @@ import threading
 import time
 
 import api.models as models
+import api.profiles as profiles
 
 
 class _DelayedAcquireLock:
@@ -46,6 +47,32 @@ def _cache_context(monkeypatch, tmp_path):
         lambda: (hermes_home, db_path, "default", cache_key),
     )
     return hermes_home, db_path, cache_key
+
+
+def test_resolve_context_cache_key_ignores_volatile_sqlite_and_index_stats(monkeypatch, tmp_path):
+    """Normal WAL/index writes must keep cache single-flight identity stable."""
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    db_path = hermes_home / "state.db"
+    db_path.write_bytes(b"db")
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    index_path = tmp_path / "sessions-index.json"
+    index_path.write_text("{}")
+
+    monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: hermes_home)
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(models, "_default_claude_code_projects_dir", lambda: projects_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", index_path)
+
+    first = models._resolve_cli_sessions_context()[3]
+    (hermes_home / "state.db-wal").write_bytes(b"new wal")
+    (hermes_home / "state.db-shm").write_bytes(b"new shm")
+    (projects_dir / "new-session.jsonl").write_text("new")
+    index_path.write_text('{"changed": true}')
+    second = models._resolve_cli_sessions_context()[3]
+
+    assert first == second
 
 
 def test_get_cli_sessions_follower_reuses_stale_rows_during_slow_rebuild(monkeypatch, tmp_path):
