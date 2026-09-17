@@ -580,11 +580,15 @@ def read_importable_agent_session_rows(
                 raw_source_where = " AND ".join(
                     clause.replace("s.", "sf.", 1) for clause in where_clauses
                 )
-                # Modern Hermes databases carry a covering (source, id)
-                # index.  Use it for the source gate so the bounded message
-                # candidate scan does not fetch every wide sessions row just
-                # to reject cron/WebUI records.  The fallback keeps older
-                # databases on the previously validated EXISTS path.
+                # [perf] 2026-09-18: The iPhone sidebar must stay responsive
+                # on a cold Mac mini state.db while the read-only hot path
+                # remains safe for the active gateway writer. Use the modern
+                # (source, id) covering index for source gates so wide session
+                # rows are fetched only after candidate IDs are bounded.
+                # Older databases keep the validated EXISTS fallback, and we
+                # reject retaining the old activity-index gate because this
+                # CTE does not use that index and would disable the fast path
+                # unnecessarily.
                 source_index_available = "idx_sessions_source_id" in session_indexes
                 if source_index_available:
                     source_lookup_cte = f"""
