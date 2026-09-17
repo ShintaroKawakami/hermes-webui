@@ -134,3 +134,26 @@ def test_sidebar_metadata_and_orphan_probe_use_bounded_timeout(tmp_path, monkeyp
         call[2]["timeout"] == agent_sessions.AGENT_STATE_DB_READ_TIMEOUT_SECONDS
         for call in calls
     )
+
+
+def test_listing_installs_and_clears_query_progress_deadline(tmp_path, monkeypatch):
+    """The query itself must be bounded in addition to SQLite busy waiting."""
+    db = tmp_path / "state.db"
+    _make_db(db, indexed=True)
+    events = []
+    real_connect = sqlite3.connect
+
+    class CapturingConnection(sqlite3.Connection):
+        def set_progress_handler(self, callback, instruction_count):
+            events.append((callback is not None, instruction_count))
+            return super().set_progress_handler(callback, instruction_count)
+
+    def connect(database, *args, **kwargs):
+        kwargs["factory"] = CapturingConnection
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(agent_sessions.sqlite3, "connect", connect)
+    assert agent_sessions.read_importable_agent_session_rows(
+        db, limit=20, exclude_sources=None
+    )
+    assert events[-2:] == [(True, 1000), (False, 0)]
