@@ -1,6 +1,7 @@
 """Shared helpers for reading Hermes Agent sessions from state.db."""
 import logging
 import sqlite3
+import time
 from contextlib import closing
 from pathlib import Path
 
@@ -28,6 +29,30 @@ CLI_MIN_UNTITLED_USER_MESSAGE_COUNT = 2
 # one poll and refreshing on the next poll preserves the native WebUI sessions
 # safely.
 AGENT_STATE_DB_READ_TIMEOUT_SECONDS = 0.25
+
+
+def _install_read_query_deadline(conn):
+    """Abort an additive sidebar query that is CPU-bound after the read budget."""
+    deadline = time.monotonic() + AGENT_STATE_DB_READ_TIMEOUT_SECONDS
+    try:
+        conn.set_progress_handler(
+            lambda: 1 if time.monotonic() >= deadline else 0,
+            1000,
+        )
+    except (AttributeError, sqlite3.Error):
+        return False
+    return True
+
+
+def _fetch_bounded_read_rows(conn, cur, query: str, params: list[object]) -> list:
+    """Execute a bounded read and keep its deadline through ``fetchall``."""
+    query_deadline_installed = _install_read_query_deadline(conn)
+    try:
+        cur.execute(query, params)
+        return cur.fetchall()
+    finally:
+        if query_deadline_installed:
+            conn.set_progress_handler(None, 0)
 
 SOURCE_LABELS = {
     'api_server': 'API',
@@ -748,7 +773,9 @@ def read_importable_agent_session_rows(
                 )
                 """
                 candidate_params = [*params, candidate_limit, *params]
-            cur.execute(
+            projected_rows = _fetch_bounded_read_rows(
+                conn,
+                cur,
                 f"""
                 {candidate_cte}
                 {select_sql}
@@ -762,7 +789,9 @@ def read_importable_agent_session_rows(
                 candidate_params,
             )
         else:
-            cur.execute(
+            projected_rows = _fetch_bounded_read_rows(
+                conn,
+                cur,
                 f"""
                 {select_sql}
                 FROM sessions s
@@ -773,7 +802,7 @@ def read_importable_agent_session_rows(
                 """,
                 params,
             )
-        projected = _project_agent_session_rows([dict(row) for row in cur.fetchall()])
+        projected = _project_agent_session_rows([dict(row) for row in projected_rows])
         projected = [_with_normalized_source(row) for row in projected]
         projected = [row for row in projected if is_cli_session_row_visible(row)]
         if limit is None:

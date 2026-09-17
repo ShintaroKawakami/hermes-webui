@@ -134,3 +134,97 @@ def test_sidebar_metadata_and_orphan_probe_use_bounded_timeout(tmp_path, monkeyp
         call[2]["timeout"] == agent_sessions.AGENT_STATE_DB_READ_TIMEOUT_SECONDS
         for call in calls
     )
+
+
+def test_listing_installs_and_clears_query_progress_deadline(tmp_path, monkeypatch):
+    """The query itself must be bounded in addition to SQLite busy waiting."""
+    db = tmp_path / "state.db"
+    _make_db(db, indexed=True)
+    events = []
+    real_connect = sqlite3.connect
+
+    class CapturingConnection(sqlite3.Connection):
+        def set_progress_handler(self, callback, instruction_count):
+            events.append((callback is not None, instruction_count))
+            return super().set_progress_handler(callback, instruction_count)
+
+    def connect(database, *args, **kwargs):
+        kwargs["factory"] = CapturingConnection
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(agent_sessions.sqlite3, "connect", connect)
+    assert agent_sessions.read_importable_agent_session_rows(
+        db, limit=20, exclude_sources=None
+    )
+    assert events[-2:] == [(True, 1000), (False, 0)]
+
+
+def test_listing_clears_query_deadline_when_fetchall_is_interrupted(
+    tmp_path, monkeypatch
+):
+    """The deadline must cover row production, not only cursor.execute()."""
+    db = tmp_path / "state.db"
+    _make_db(db, indexed=True)
+    real_connect = sqlite3.connect
+
+    class FetchallInterruptCursor:
+        def __init__(self, cursor, connection):
+            self._cursor = cursor
+            self._connection = connection
+
+        def execute(self, *args, **kwargs):
+            self._cursor.execute(*args, **kwargs)
+            return self
+
+        def fetchall(self):
+            callback = self._connection.progress_callback
+            if callback is not None and callback():
+                raise sqlite3.OperationalError("interrupted")
+            return self._cursor.fetchall()
+
+        def __getattr__(self, name):
+            return getattr(self._cursor, name)
+
+    class FetchallInterruptConnection:
+        def __init__(self, connection):
+            self._connection = connection
+            self.progress_callback = None
+            self.events = []
+
+        @property
+        def row_factory(self):
+            return self._connection.row_factory
+
+        @row_factory.setter
+        def row_factory(self, value):
+            self._connection.row_factory = value
+
+        def set_progress_handler(self, callback, instruction_count):
+            self.progress_callback = callback
+            self.events.append((callback is not None, instruction_count))
+
+        def cursor(self):
+            return FetchallInterruptCursor(self._connection.cursor(), self)
+
+        def close(self):
+            self._connection.close()
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    holder = []
+
+    def connect(database, *args, **kwargs):
+        connection = FetchallInterruptConnection(real_connect(database, *args, **kwargs))
+        holder.append(connection)
+        return connection
+
+    monkeypatch.setattr(agent_sessions.sqlite3, "connect", connect)
+    clock = iter((100.0, 100.3))
+    monkeypatch.setattr(agent_sessions.time, "monotonic", lambda: next(clock))
+    with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+        agent_sessions.read_importable_agent_session_rows(
+            db, limit=20, exclude_sources=None
+        )
+
+    assert holder[0].events[-2:] == [(True, 1000), (False, 0)]
