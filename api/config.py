@@ -849,6 +849,7 @@ _FALLBACK_MODELS = [
     {"provider": "MiniMax",   "id": "minimax/MiniMax-M2.7",             "label": "MiniMax M2.7"},
     {"provider": "MiniMax",   "id": "minimax/MiniMax-M2.7-highspeed",   "label": "MiniMax M2.7 Highspeed"},
     # Z.AI / GLM
+    {"provider": "Z.AI",      "id": "zai/glm-5.2",                      "label": "GLM-5.2"},
     {"provider": "Z.AI",      "id": "zai/glm-5.1",                      "label": "GLM-5.1"},
     {"provider": "Z.AI",      "id": "zai/glm-5",                        "label": "GLM-5"},
     {"provider": "Z.AI",      "id": "zai/glm-5-turbo",                  "label": "GLM-5 Turbo"},
@@ -1319,12 +1320,18 @@ _PROVIDER_MODELS = {
         {"id": "@nous:google/gemini-3.1-pro-preview", "label": "Gemini 3.1 Pro Preview (via Nous)"},
     ],
     "zai": [
+        # [feat] CaD 2026-09-17: These models are served through the Z.AI endpoint,
+        # not the separate kimi-coding Moonshot API provider.
+        {"id": "glm-5.2", "label": "GLM-5.2"},
         {"id": "glm-5.1", "label": "GLM-5.1"},
         {"id": "glm-5", "label": "GLM-5"},
         {"id": "glm-5-turbo", "label": "GLM-5 Turbo"},
         {"id": "glm-4.7", "label": "GLM-4.7"},
         {"id": "glm-4.5", "label": "GLM-4.5"},
         {"id": "glm-4.5-flash", "label": "GLM-4.5 Flash"},
+        {"id": "kimi-for-coding", "label": "Kimi for Coding"},
+        {"id": "kimi-for-coding-highspeed", "label": "Kimi for Coding Highspeed"},
+        {"id": "k3", "label": "K3"},
     ],
     "kimi-coding": [
         {"id": "moonshot-v1-8k", "label": "Moonshot v1 8k"},
@@ -4985,10 +4992,16 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
                                             "label": k.get("label", k["id"]) if isinstance(k, dict) else k}
                                            for k in cfg_models]
 
+                    live_ids = []
                     if not raw_models:
-                        raw_models = _models_from_live_provider_ids(
-                            pid,
-                            _read_live_provider_model_ids(pid),
+                        live_ids = _read_live_provider_model_ids(pid)
+                        raw_models = _models_from_live_provider_ids(pid, live_ids)
+
+                    if pid == "zai" and live_ids:
+                        live_model_ids = {model["id"] for model in raw_models}
+                        raw_models.extend(
+                            model for model in _PROVIDER_MODELS[pid]
+                            if model["id"] not in live_model_ids
                         )
 
                     if not raw_models:
