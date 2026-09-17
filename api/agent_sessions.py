@@ -570,17 +570,42 @@ def read_importable_agent_session_rows(
             # other rows filtered after projection.
             candidate_limit = max(result_limit * 8, result_limit)
             if fast_message_candidates:
+                # The grouped message timestamps are narrow enough to scan on
+                # a cold state.db, but joining every grouped session back to
+                # the wide ``sessions`` table before LIMIT defeats that win.
+                # Take a larger ID-only window first, then fetch session rows
+                # for the surviving candidates.  The extra headroom absorbs
+                # excluded sources and compression rows without restoring a
+                # full wide-table sort.
+                candidate_scan_limit = max(candidate_limit * 8, candidate_limit)
                 candidate_cte = f"""
                 WITH latest_messages AS (
                     SELECT mx.session_id, MAX(mx.timestamp) AS last_message_at
                     FROM messages mx
                     GROUP BY mx.session_id
-                ), message_candidates AS (
-                    SELECT lm.session_id AS id, lm.last_message_at, s.started_at
+                ), message_candidates_raw AS (
+                    SELECT lm.session_id AS id, lm.last_message_at
+                    FROM latest_messages lm
+                    WHERE lm.last_message_at IS NOT NULL
+                    ORDER BY lm.last_message_at DESC
+                    LIMIT ?
+                ), null_message_candidates AS (
+                    SELECT lm.session_id AS id, lm.last_message_at
                     FROM latest_messages lm
                     JOIN sessions s ON s.id = lm.session_id
+                    WHERE lm.last_message_at IS NULL
+                    ORDER BY s.started_at DESC
+                    LIMIT ?
+                ), message_candidates AS (
+                    SELECT mc.id, mc.last_message_at, s.started_at
+                    FROM (
+                        SELECT id, last_message_at FROM message_candidates_raw
+                        UNION ALL
+                        SELECT id, last_message_at FROM null_message_candidates
+                    ) mc
+                    CROSS JOIN sessions s ON s.id = mc.id
                     WHERE {' AND '.join(where_clauses)}
-                    ORDER BY COALESCE(lm.last_message_at, s.started_at) DESC,
+                    ORDER BY COALESCE(mc.last_message_at, s.started_at) DESC,
                              s.started_at DESC
                     LIMIT ?
                 ), empty_candidates AS (
@@ -599,7 +624,14 @@ def read_importable_agent_session_rows(
                     SELECT id, last_message_at, started_at FROM empty_candidates
                 )
                 """
-                candidate_params = [*params, candidate_limit, *params, candidate_limit]
+                candidate_params = [
+                    candidate_scan_limit,
+                    candidate_scan_limit,
+                    *params,
+                    candidate_limit,
+                    *params,
+                    candidate_limit,
+                ]
             else:
                 candidate_cte = f"""
                 WITH candidates AS (
@@ -615,8 +647,8 @@ def read_importable_agent_session_rows(
                 f"""
                 {candidate_cte}
                 {select_sql}
-                FROM sessions s
-                JOIN candidates c ON c.id = s.id
+                FROM candidates c
+                CROSS JOIN sessions s ON s.id = c.id
                 {join_clause}
                 {group_by_clause}
                 {order_by_clause}

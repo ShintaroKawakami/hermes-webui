@@ -77,6 +77,7 @@ def _make_modern_state_db(path, *, sessions=80):
         );
         CREATE INDEX idx_sessions_effective_activity
             ON sessions(COALESCE(last_activity_at, started_at) DESC, started_at DESC);
+        CREATE INDEX idx_sessions_started ON sessions(started_at DESC);
         CREATE TABLE messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT,
@@ -143,7 +144,7 @@ def test_importable_agent_rows_push_sidebar_limit_into_sql(tmp_path):
 
     src = (REPO_ROOT / "api" / "agent_sessions.py").read_text()
     assert "WITH candidates AS" in src
-    assert "JOIN candidates c ON c.id = s.id" in src
+    assert "CROSS JOIN sessions s ON s.id = c.id" in src
     assert "SELECT MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id" in src
     assert "candidate_limit = max(result_limit * 8, result_limit)" in src
 
@@ -224,6 +225,50 @@ def test_modern_candidate_projection_keeps_resumed_old_session(tmp_path):
     src = (REPO_ROOT / "api" / "agent_sessions.py").read_text()
     assert "WITH latest_messages AS" in src
     assert "FROM latest_messages lm" in src
+    assert "message_candidates_raw" in src
+    assert "CROSS JOIN sessions s ON s.id = mc.id" in src
+
+
+def test_modern_candidate_projection_limits_before_wide_session_lookup(tmp_path):
+    """The modern candidate plan must fetch wide session rows by candidate ID."""
+    db = tmp_path / "state.db"
+    _make_modern_state_db(db)
+    conn = sqlite3.connect(str(db))
+    plan = conn.execute(
+        """
+        EXPLAIN QUERY PLAN
+        WITH latest_messages AS (
+            SELECT mx.session_id, MAX(mx.timestamp) AS last_message_at
+            FROM messages mx
+            GROUP BY mx.session_id
+        ), message_candidates_raw AS (
+            SELECT lm.session_id AS id, lm.last_message_at
+            FROM latest_messages lm
+            WHERE lm.last_message_at IS NOT NULL
+            ORDER BY lm.last_message_at DESC
+            LIMIT ?
+        ), message_candidates AS (
+            SELECT mc.id, mc.last_message_at, s.started_at
+            FROM (
+                SELECT id, last_message_at FROM message_candidates_raw
+            ) mc
+            CROSS JOIN sessions s ON s.id = mc.id
+            WHERE s.source IS NOT NULL
+            ORDER BY COALESCE(mc.last_message_at, s.started_at) DESC,
+                     s.started_at DESC
+            LIMIT ?
+        )
+        SELECT s.id
+        FROM message_candidates c
+        CROSS JOIN sessions s ON s.id = c.id
+        """,
+        (160, 160),
+    ).fetchall()
+    conn.close()
+
+    details = [row[3] for row in plan]
+    assert any("SEARCH s USING INDEX sqlite_autoindex_sessions_1 (id=?)" in detail for detail in details)
+    assert not any(detail == "SCAN s" for detail in details)
 
 
 def test_modern_candidate_projection_falls_back_to_started_at_for_null_timestamp(tmp_path):
