@@ -39,8 +39,9 @@ def test_request_diagnostics_timeout_record_includes_stage_and_thread_stacks(cap
     assert record["thread_stacks"]
 
 
-def test_request_diagnostics_maybe_start_is_limited_to_issue1855_paths():
+def test_request_diagnostics_maybe_start_covers_latency_sensitive_paths():
     assert RequestDiagnostics.maybe_start("GET", "/api/sessions") is not None
+    assert RequestDiagnostics.maybe_start("GET", "/api/profiles") is not None
     assert RequestDiagnostics.maybe_start("POST", "/api/chat/start") is not None
     assert RequestDiagnostics.maybe_start("GET", "/health") is None
     assert RequestDiagnostics.maybe_start("POST", "/api/session/new") is None
@@ -96,6 +97,10 @@ def test_issue1855_target_routes_are_wired_to_diagnostics():
 
     assert 'RequestDiagnostics.maybe_start("GET", parsed.path' in src
     assert "all_sessions(diag=diag)" in src
+    assert 'RequestDiagnostics.maybe_start("GET", parsed.path' in src
+    assert "list_profiles_api(diag=diag)" in src
+    for stage in ("profile_enumeration", "skill_stats", "row_format"):
+        assert stage in Path("api/profiles.py").read_text(encoding="utf-8")
     assert 'RequestDiagnostics.maybe_start("POST", parsed.path' in src
     assert "_handle_chat_start(handler, body, diag=diag)" in src
     for stage in (

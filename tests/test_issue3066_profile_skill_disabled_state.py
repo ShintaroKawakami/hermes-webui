@@ -65,12 +65,48 @@ def test_skill_toggle_writes_active_profile_config_not_default(monkeypatch, tmp_
     monkeypatch.setattr(routes, "j", lambda _handler, payload: payload)
     monkeypatch.setattr(routes, "bad", lambda _handler, message, status=400: {"error": message, "status": status})
 
+    profiles._SKILLS_STATS_CACHE[active_home] = (1, 1, 9999999999.0)
+    profiles._LIST_PROFILES_CACHE = ([{"name": "editor"}], 9999999999.0)
     enabled_response = routes._handle_skill_toggle(None, {"name": "gamma", "enabled": True})
     assert enabled_response == {"ok": True, "name": "gamma", "enabled": True}
+    assert profiles._SKILLS_STATS_CACHE == {}
+    assert profiles._LIST_PROFILES_CACHE is None
     assert _load_config(active_home)["skills"]["disabled"] == []
     assert _load_config(default_home)["skills"]["disabled"] == []
 
+    profiles._SKILLS_STATS_CACHE[active_home] = (1, 1, 9999999999.0)
+    profiles._LIST_PROFILES_CACHE = ([{"name": "editor"}], 9999999999.0)
     disabled_response = routes._handle_skill_toggle(None, {"name": "gamma", "enabled": False})
     assert disabled_response == {"ok": True, "name": "gamma", "enabled": False}
+    assert profiles._SKILLS_STATS_CACHE == {}
+    assert profiles._LIST_PROFILES_CACHE is None
     assert _load_config(active_home)["skills"]["disabled"] == ["gamma"]
     assert _load_config(default_home)["skills"]["disabled"] == []
+
+
+@requires_agent_modules
+def test_skill_save_and_delete_invalidate_profile_skill_stats_cache(monkeypatch, tmp_path):
+    from api import profiles, routes
+
+    active_home = tmp_path / "profiles" / "editor"
+    active_home.mkdir(parents=True)
+    monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: active_home)
+    monkeypatch.setattr(routes, "j", lambda _handler, payload: payload)
+    monkeypatch.setattr(routes, "bad", lambda _handler, message, status=400: {"error": message, "status": status})
+
+    profiles._SKILLS_STATS_CACHE[active_home] = (1, 1, 9999999999.0)
+    profiles._LIST_PROFILES_CACHE = ([{"name": "editor"}], 9999999999.0)
+    saved = routes._handle_skill_save(
+        None,
+        {"name": "delta", "content": "---\nname: delta\ndescription: delta\n---\n"},
+    )
+    assert saved["ok"] is True
+    assert profiles._SKILLS_STATS_CACHE == {}
+    assert profiles._LIST_PROFILES_CACHE is None
+
+    profiles._SKILLS_STATS_CACHE[active_home] = (1, 1, 9999999999.0)
+    profiles._LIST_PROFILES_CACHE = ([{"name": "editor"}], 9999999999.0)
+    deleted = routes._handle_skill_delete(None, {"name": "delta"})
+    assert deleted["ok"] is True
+    assert profiles._SKILLS_STATS_CACHE == {}
+    assert profiles._LIST_PROFILES_CACHE is None

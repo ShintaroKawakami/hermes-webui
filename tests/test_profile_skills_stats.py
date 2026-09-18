@@ -134,7 +134,7 @@ def test_skills_stats_cache(tmp_path):
     enabled, compat = profiles._get_profile_skills_stats(tmp_path)
     assert enabled == 1 and compat == 1
 
-    # Add a skill but since cache is active (TTL 8s), we should still get old values
+    # Add a skill but since cache is active (TTL 60s), we should still get old values
     _write_skill(tmp_path, "beta")
     enabled, compat = profiles._get_profile_skills_stats(tmp_path)
     assert enabled == 1 and compat == 1
