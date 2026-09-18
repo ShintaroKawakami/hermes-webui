@@ -2813,10 +2813,22 @@ def _run_background_title_update(session_id: str, user_text: str, assistant_text
         effective_title = current
         if next_title:
             with _get_session_agent_lock(session_id):
+                # The title model runs after the turn's done event.  A user
+                # (or the smoke cleanup) may delete the session while this
+                # background request is in flight.  Re-load under the
+                # per-session lock before saving so a stale Session object
+                # cannot resurrect a deleted sidecar.
+                try:
+                    latest_session = get_session(session_id)
+                except KeyError:
+                    _put_title_status(put_event, session_id, 'skipped', 'missing_session')
+                    return
                 with LOCK:
                     cached_session = SESSIONS.get(session_id)
                     if cached_session is not None and getattr(cached_session, 'session_id', None) == session_id:
                         s = cached_session
+                    else:
+                        s = latest_session
                     effective_title = str(s.title or '').strip()
                     manual_title = session_has_manual_title(s)
                     invalid_existing_now = _looks_invalid_generated_title(s.title)

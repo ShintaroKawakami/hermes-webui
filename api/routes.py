@@ -7029,6 +7029,99 @@ def handle_get(handler, parsed) -> bool:
 # ── GET route helpers
 
 
+def _delete_session_for_webui(handler, body):
+    """Delete one WebUI session while serializing with background writers.
+
+    Background title generation runs after the chat stream has emitted its
+    terminal event.  It must not be able to save a stale Session object after
+    this endpoint has removed the sidecar.  The per-session lock is shared by
+    the streaming/title paths, so either the final save happens before this
+    deletion or the title path observes that the session is already gone.
+    """
+    sid = body.get("session_id", "")
+    if not sid:
+        return bad(handler, "session_id is required")
+    if not is_safe_session_id(sid):
+        return bad(handler, "Invalid session_id", 400)
+
+    with _get_session_agent_lock(sid):
+        cli_meta_for_delete = _lookup_cli_session_metadata(sid)
+        if cli_meta_for_delete.get("read_only"):
+            return bad(handler, "Read-only imported sessions cannot be deleted from WebUI", 400)
+        is_messaging_session = _is_messaging_session_id(sid)
+        worktree_retained = _worktree_retained_payload_for_session_id(sid)
+        try:
+            event_profile = getattr(get_session(sid, metadata_only=True), "profile", None)
+        except KeyError:
+            event_profile = None
+        except Exception:
+            logger.debug("Failed to resolve profile for deleted session %s", sid, exc_info=True)
+            event_profile = None
+        # Delete from WebUI session store
+        with LOCK:
+            SESSIONS.pop(sid, None)
+        # Evict cached agent so turn count doesn't leak into a recycled session
+        from api.config import _evict_session_agent
+        _evict_session_agent(sid)
+        try:
+            p = (SESSION_DIR / f"{sid}.json").resolve()
+            p.relative_to(SESSION_DIR.resolve())
+        except Exception:
+            return bad(handler, "Invalid session_id", 400)
+        try:
+            p.unlink(missing_ok=True)
+            p.with_suffix('.json.bak').unlink(missing_ok=True)
+        except Exception:
+            logger.debug("Failed to unlink session file %s", p)
+        try:
+            prune_session_from_index(sid)
+        except Exception:
+            logger.debug("Failed to prune deleted session from index: %s", sid, exc_info=True)
+        try:
+            from api.upload import _session_attachment_dir
+
+            shutil.rmtree(_session_attachment_dir(sid), ignore_errors=True)
+        except Exception:
+            logger.debug("Failed to clean attachment dir for deleted session %s", sid)
+        # Remove the turn-journal shards and the run-journal directory so a
+        # deleted conversation is not recoverable from disk. The session JSON +
+        # state.db rows are cleared above, but these journals retain the user's
+        # messages (turn journal) and the full request/response payloads (run
+        # journal) in plaintext. (#3802)
+        try:
+            from api.turn_journal import delete_turn_journal
+
+            delete_turn_journal(sid)
+        except Exception:
+            logger.debug("Failed to delete turn journal for deleted session %s", sid)
+        try:
+            from api.run_journal import delete_run_journal
+
+            delete_run_journal(sid)
+        except Exception:
+            logger.debug("Failed to delete run journal for deleted session %s", sid)
+        # Prune the per-session agent lock so deleted sessions don't leak
+        # Lock entries in SESSION_AGENT_LOCKS forever.
+        with SESSION_AGENT_LOCKS_LOCK:
+            SESSION_AGENT_LOCKS.pop(sid, None)
+        try:
+            from api.terminal import close_terminal
+            close_terminal(sid)
+        except Exception:
+            logger.debug("Failed to close workspace terminal for deleted session %s", sid)
+        # Also delete from CLI state.db for CLI sessions shown in sidebar,
+        # but never erase external messaging channel memory via WebUI delete.
+        if not is_messaging_session:
+            try:
+                from api.models import delete_cli_session
+
+                delete_cli_session(sid)
+            except Exception:
+                logger.debug("Failed to delete CLI session %s", sid)
+        _publish_session_list_changed("session_delete", profile=event_profile)
+        return j(handler, {"ok": True, **worktree_retained})
+
+
 def handle_post(handler, parsed) -> bool:
     """Handle all POST routes. Returns True if handled, False for 404."""
     diag = RequestDiagnostics.maybe_start("POST", parsed.path, logger=logger)
@@ -7693,86 +7786,10 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, _sanitize_error(exc), status=500)
 
     if parsed.path == "/api/session/delete":
-        sid = body.get("session_id", "")
-        if not sid:
-            return bad(handler, "session_id is required")
-        if not is_safe_session_id(sid):
-            return bad(handler, "Invalid session_id", 400)
-        cli_meta_for_delete = _lookup_cli_session_metadata(sid)
-        if cli_meta_for_delete.get("read_only"):
-            return bad(handler, "Read-only imported sessions cannot be deleted from WebUI", 400)
-        is_messaging_session = _is_messaging_session_id(sid)
-        worktree_retained = _worktree_retained_payload_for_session_id(sid)
-        try:
-            event_profile = getattr(get_session(sid, metadata_only=True), "profile", None)
-        except KeyError:
-            event_profile = None
-        except Exception:
-            logger.debug("Failed to resolve profile for deleted session %s", sid, exc_info=True)
-            event_profile = None
-        # Delete from WebUI session store
-        with LOCK:
-            SESSIONS.pop(sid, None)
-        # Evict cached agent so turn count doesn't leak into a recycled session
-        from api.config import _evict_session_agent
-        _evict_session_agent(sid)
-        try:
-            p = (SESSION_DIR / f"{sid}.json").resolve()
-            p.relative_to(SESSION_DIR.resolve())
-        except Exception:
-            return bad(handler, "Invalid session_id", 400)
-        try:
-            p.unlink(missing_ok=True)
-            p.with_suffix('.json.bak').unlink(missing_ok=True)
-        except Exception:
-            logger.debug("Failed to unlink session file %s", p)
-        try:
-            prune_session_from_index(sid)
-        except Exception:
-            logger.debug("Failed to prune deleted session from index: %s", sid, exc_info=True)
-        try:
-            from api.upload import _session_attachment_dir
-
-            shutil.rmtree(_session_attachment_dir(sid), ignore_errors=True)
-        except Exception:
-            logger.debug("Failed to clean attachment dir for deleted session %s", sid)
-        # Remove the turn-journal shards and the run-journal directory so a
-        # deleted conversation is not recoverable from disk. The session JSON +
-        # state.db rows are cleared above, but these journals retain the user's
-        # messages (turn journal) and the full request/response payloads (run
-        # journal) in plaintext. (#3802)
-        try:
-            from api.turn_journal import delete_turn_journal
-
-            delete_turn_journal(sid)
-        except Exception:
-            logger.debug("Failed to delete turn journal for deleted session %s", sid)
-        try:
-            from api.run_journal import delete_run_journal
-
-            delete_run_journal(sid)
-        except Exception:
-            logger.debug("Failed to delete run journal for deleted session %s", sid)
-        # Prune the per-session agent lock so deleted sessions don't leak
-        # Lock entries in SESSION_AGENT_LOCKS forever.
-        with SESSION_AGENT_LOCKS_LOCK:
-            SESSION_AGENT_LOCKS.pop(sid, None)
-        try:
-            from api.terminal import close_terminal
-            close_terminal(sid)
-        except Exception:
-            logger.debug("Failed to close workspace terminal for deleted session %s", sid)
-        # Also delete from CLI state.db for CLI sessions shown in sidebar,
-        # but never erase external messaging channel memory via WebUI delete.
-        if not is_messaging_session:
-            try:
-                from api.models import delete_cli_session
-
-                delete_cli_session(sid)
-            except Exception:
-                logger.debug("Failed to delete CLI session %s", sid)
-        _publish_session_list_changed("session_delete", profile=event_profile)
-        return j(handler, {"ok": True, **worktree_retained})
+        # _delete_session_for_webui performs the exact-ID filesystem cleanup,
+        # including prune_session_from_index(sid) and
+        # with_suffix('.json.bak').unlink, under the per-session lock.
+        return _delete_session_for_webui(handler, body)
 
     if parsed.path == "/api/session/clear":
         try:
