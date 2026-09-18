@@ -70,6 +70,7 @@ class RequestDiagnostics:
         clean_path = str(path or "").split("?", 1)[0]
         if (method.upper(), clean_path) not in {
             ("GET", "/api/sessions"),
+            ("GET", "/api/profiles"),
             ("POST", "/api/chat/start"),
         }:
             return None

@@ -42,6 +42,19 @@ from api.session_events import (
 logger = logging.getLogger(__name__)
 
 
+def _invalidate_profile_skill_stats_cache() -> None:
+    """Invalidate profile skill counts and list rows after a skill mutation."""
+    try:
+        from api.profiles import _SKILLS_STATS_CACHE, _invalidate_list_profiles_cache
+
+        _SKILLS_STATS_CACHE.clear()
+        _invalidate_list_profiles_cache()
+    except Exception:
+        # Cache invalidation must never turn a successful skill mutation into a
+        # 500, especially during startup when profiles may still be importing.
+        logger.debug("Failed to invalidate profile skill stats cache", exc_info=True)
+
+
 def _publish_session_list_changed(reason: str, *, profile: str | None = None) -> None:
     """Publish profile-scoped session changes while tolerating legacy test doubles."""
     if not profile:
@@ -6717,12 +6730,18 @@ def handle_get(handler, parsed) -> bool:
 
     # ── Profile API (GET) ──
     if parsed.path == "/api/profiles":
-        from api.profiles import list_profiles_api, get_active_profile_name
+        diag = RequestDiagnostics.maybe_start("GET", parsed.path, logger=logger)
+        try:
+            diag.stage("list_profiles_api")
+            from api.profiles import list_profiles_api, get_active_profile_name
 
-        return j(
-            handler,
-            {"profiles": list_profiles_api(), "active": get_active_profile_name()},
-        )
+            profiles = list_profiles_api(diag=diag)
+            diag.stage("active_profile")
+            active = get_active_profile_name()
+            diag.stage("response_write")
+            return j(handler, {"profiles": profiles, "active": active})
+        finally:
+            diag.finish()
 
     if parsed.path == "/api/profile/active":
         from api.profiles import (
@@ -15509,6 +15528,7 @@ def _handle_skill_save(handler, body):
     skill_dir.mkdir(parents=True, exist_ok=True)
     skill_file = skill_dir / "SKILL.md"
     skill_file.write_text(body["content"], encoding="utf-8")
+    _invalidate_profile_skill_stats_cache()
     return j(handler, {"ok": True, "name": skill_name, "path": str(skill_file)})
 
 
@@ -15528,6 +15548,7 @@ def _handle_skill_delete(handler, body):
         return bad(handler, "Skill not found", 404)
     skill_dir = matches[0].parent
     shutil.rmtree(str(skill_dir))
+    _invalidate_profile_skill_stats_cache()
     return j(handler, {"ok": True, "name": body["name"]})
 
 
@@ -15602,6 +15623,7 @@ def _handle_skill_toggle(handler, body):
         _save_yaml_config_file(config_path, cfg)
 
     reload_config()  # outside with block — reload_config() acquires the lock itself
+    _invalidate_profile_skill_stats_cache()
 
     return j(handler, {"ok": True, "name": name, "enabled": enabled})
 

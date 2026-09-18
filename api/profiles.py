@@ -1092,7 +1092,11 @@ def switch_profile(name: str, *, process_wide: bool = True) -> dict:
 
 
 _SKILLS_STATS_CACHE: dict[Path, tuple[int, int, float]] = {}
-_SKILLS_STATS_CACHE_TTL = 8.0  # seconds
+# Skill frontmatter is immutable for normal profile-list requests. Keep the
+# completed result warm long enough that repeated iPhone/WebUI list requests do
+# not rescan every profile, while explicit skill/config mutations still clear
+# this cache through the existing invalidation hooks.
+_SKILLS_STATS_CACHE_TTL = 60.0  # seconds
 # [fix] CaD 2026-09-17: per-profile/list locks serialize scans and cold builds;
 # one global lock is rejected because unrelated profiles should proceed freely.
 _SKILLS_STATS_LOCKS: dict[Path, threading.Lock] = {}
@@ -1117,7 +1121,7 @@ def _get_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
         skills_dir = profile_dir / "skills"
         if not skills_dir.is_dir():
             res = (0, 0)
-            _SKILLS_STATS_CACHE[profile_dir] = (res[0], res[1], now + _SKILLS_STATS_CACHE_TTL)
+            _SKILLS_STATS_CACHE[profile_dir] = (res[0], res[1], time.time() + _SKILLS_STATS_CACHE_TTL)
             return res
 
         disabled = set()
@@ -1167,7 +1171,10 @@ def _get_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
                 pass
 
         res = (enabled_count, compatible_count)
-        _SKILLS_STATS_CACHE[profile_dir] = (res[0], res[1], now + _SKILLS_STATS_CACHE_TTL)
+        # Stamp freshness after the scan. A cold multi-profile build must not
+        # expire immediately because the timestamp was captured before the
+        # expensive work completed.
+        _SKILLS_STATS_CACHE[profile_dir] = (res[0], res[1], time.time() + _SKILLS_STATS_CACHE_TTL)
         return res
 
 
@@ -1185,7 +1192,7 @@ def _invalidate_list_profiles_cache() -> None:
         _LIST_PROFILES_CACHE = None
 
 
-def _build_profile_rows_fast() -> list | None:
+def _build_profile_rows_fast(diag=None) -> list | None:
     """Build the profile list WITHOUT the upstream alias scan.
 
     ``hermes_cli.profiles.list_profiles()`` calls ``find_alias_for_profile()``
@@ -1216,7 +1223,7 @@ def _build_profile_rows_fast() -> list | None:
     except Exception:
         return None
 
-    def _row(home: Path, name: str, is_default: bool) -> dict:
+    def _row(home: Path, name: str, is_default: bool, skill_stats=None) -> dict:
         try:
             model, provider = _read_config_model(home)
         except Exception:
@@ -1225,7 +1232,9 @@ def _build_profile_rows_fast() -> list | None:
             gateway_running = _check_gateway_running(home)
         except Exception:
             gateway_running = False
-        enabled_count, total_count = _get_profile_skills_stats(home)
+        if skill_stats is None:
+            skill_stats = _get_profile_skills_stats(home)
+        enabled_count, total_count = skill_stats
         return {
             'name': name,
             'path': str(home),
@@ -1241,12 +1250,12 @@ def _build_profile_rows_fast() -> list | None:
             'total_skills': total_count,
         }
 
-    rows: list = []
+    profile_specs: list[tuple[Path, str, bool]] = []
     default_home = _get_default_hermes_home()
     if default_home.is_dir():
         # Upstream hardcodes the base home's display name to "default" even when
         # the directory is literally ".hermes" — match that exactly.
-        rows.append(_row(default_home, 'default', True))
+        profile_specs.append((default_home, 'default', True))
 
     profiles_root = _get_profiles_root()
     if profiles_root.is_dir():
@@ -1255,12 +1264,45 @@ def _build_profile_rows_fast() -> list | None:
                 continue
             if not _UPSTREAM_PROFILE_ID_RE.match(entry.name):
                 continue
-            rows.append(_row(entry, entry.name, False))
+            profile_specs.append((entry, entry.name, False))
+
+    if diag is not None:
+        diag.stage("profile_enumeration")
+
+    # Skill stats are independent per profile. Bound concurrency so a cold
+    # list request finishes within the mobile client's request budget without
+    # creating an unbounded disk-I/O burst.
+    stats_by_home = {}
+    if profile_specs:
+        from concurrent.futures import ThreadPoolExecutor
+
+        worker_count = min(4, len(profile_specs))
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            stats = pool.map(
+                _get_profile_skills_stats,
+                (home for home, _, _ in profile_specs),
+            )
+            stats_by_home = {
+                home: result
+                for (home, _, _), result in zip(profile_specs, stats)
+            }
+
+    if diag is not None:
+        diag.stage("skill_stats")
+
+    rows = []
+    for home, name, is_default in profile_specs:
+        # _row() remains the single formatter; only the independent expensive
+        # skill scan is fanned out above.
+        rows.append(_row(home, name, is_default, stats_by_home.get(home)))
+
+    if diag is not None:
+        diag.stage("row_format")
 
     return rows
 
 
-def list_profiles_api() -> list:
+def list_profiles_api(diag=None) -> list:
     """List all profiles with metadata, serialized for JSON response.
 
     Fast path: build the rows from upstream's cheap per-profile helpers and skip
@@ -1291,7 +1333,7 @@ def list_profiles_api() -> list:
             # Return a fresh copy with is_active recomputed (cheap, per-request).
             return [{**p, 'is_active': p['name'] == active} for p in cached[0]]
 
-        rows = _build_profile_rows_fast()
+        rows = _build_profile_rows_fast(diag=diag) if diag is not None else _build_profile_rows_fast()
         if rows is None:
             # Fallback: cheap helpers unavailable — use the original (slow) path,
             # or the default-only dict if hermes_cli isn't importable at all.
@@ -1301,11 +1343,15 @@ def list_profiles_api() -> list:
             )
             try:
                 from hermes_cli.profiles import list_profiles
+                if diag is not None:
+                    diag.stage("profile_enumeration")
                 infos = list_profiles()
             except ImportError:
                 return [_default_profile_dict()]
 
             active = get_active_profile_name()
+            if diag is not None:
+                diag.stage("skill_stats")
             result = []
             for p in infos:
                 enabled_count, total_count = _get_profile_skills_stats(p.path)
@@ -1323,6 +1369,8 @@ def list_profiles_api() -> list:
                     'enabled_skills': enabled_count,
                     'total_skills': total_count,
                 })
+            if diag is not None:
+                diag.stage("row_format")
             return result
 
         # Stamp freshness only after the cold build completed successfully.
